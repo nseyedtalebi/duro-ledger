@@ -1,0 +1,4 @@
+.claude/
+.env
+.duro-postgres-data/
+.duro-certs/
