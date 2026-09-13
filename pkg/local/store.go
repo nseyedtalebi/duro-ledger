@@ -107,7 +107,35 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := ensureResourceURIColumn(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+func ensureResourceURIColumn(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(local_events)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, kind string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == "resource_uri" {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(`ALTER TABLE local_events ADD COLUMN resource_uri TEXT NOT NULL DEFAULT ''`)
+	return err
 }
 
 // Close closes the underlying database.
@@ -243,17 +271,17 @@ func (s *Store) EnqueueWithBlobRef(ev event.Event, digest string, size int64, me
 // blob row in the same transaction do so before committing, so the event
 // and its blob land atomically.
 func checkOrInsertEvent(tx *sql.Tx, ev event.Event) (fresh bool, err error) {
-	var occurredAt, eventType, actor, content, refs string
+	var occurredAt, eventType, actor, content, refs, resourceURI string
 	err = tx.QueryRow(
-		`SELECT occurred_at, event_type, actor, content, refs FROM local_events WHERE id = ?`, ev.ID,
-	).Scan(&occurredAt, &eventType, &actor, &content, &refs)
+		`SELECT occurred_at, event_type, actor, content, refs, resource_uri FROM local_events WHERE id = ?`, ev.ID,
+	).Scan(&occurredAt, &eventType, &actor, &content, &refs, &resourceURI)
 	switch {
 	case err == sql.ErrNoRows:
 		_, err = tx.Exec(
-			`INSERT INTO local_events(id, occurred_at, event_type, actor, content, refs, local_created)
-			 VALUES (?,?,?,?,?,?,?)`,
+			`INSERT INTO local_events(id, occurred_at, event_type, actor, content, refs, resource_uri, local_created)
+			 VALUES (?,?,?,?,?,?,?,?)`,
 			ev.ID, ev.OccurredAt.UTC().Format(timeLayout), ev.EventType, ev.Actor,
-			string(ev.Content), string(ev.Refs), encodeLocalCreated(time.Now()),
+			string(ev.Content), string(ev.Refs), ev.ResourceURI, encodeLocalCreated(time.Now()),
 		)
 		if err != nil {
 			return false, err
@@ -270,7 +298,7 @@ func checkOrInsertEvent(tx *sql.Tx, ev event.Event) (fresh bool, err error) {
 		if err != nil {
 			return false, fmt.Errorf("local: comparing refs for %s: %w", ev.ID, err)
 		}
-		if occurredAt == ev.OccurredAt.UTC().Format(timeLayout) && eventType == ev.EventType && actor == ev.Actor && contentEqual && refsEqual {
+		if occurredAt == ev.OccurredAt.UTC().Format(timeLayout) && eventType == ev.EventType && actor == ev.Actor && contentEqual && refsEqual && resourceURI == ev.ResourceURI {
 			return false, nil
 		}
 		return false, ErrConflict
@@ -352,7 +380,7 @@ func (s *Store) PendingBlob(id string) (Blob, bool, error) {
 // Rejected rows remain pending so callers can inspect or retry them.
 func (s *Store) Pending() ([]PendingRow, error) {
 	rows, err := s.db.Query(
-		`SELECT id, occurred_at, event_type, actor, content, refs, local_created, last_error
+		`SELECT id, occurred_at, event_type, actor, content, refs, resource_uri, local_created, last_error
 		 FROM local_events WHERE synced_at IS NULL ORDER BY local_created ASC, rowid ASC`,
 	)
 	if err != nil {
@@ -362,10 +390,10 @@ func (s *Store) Pending() ([]PendingRow, error) {
 
 	var out []PendingRow
 	for rows.Next() {
-		var id, occurredAt, eventType, actor, content, refs string
+		var id, occurredAt, eventType, actor, content, refs, resourceURI string
 		var localCreated int64
 		var lastError sql.NullString
-		if err := rows.Scan(&id, &occurredAt, &eventType, &actor, &content, &refs, &localCreated, &lastError); err != nil {
+		if err := rows.Scan(&id, &occurredAt, &eventType, &actor, &content, &refs, &resourceURI, &localCreated, &lastError); err != nil {
 			return nil, err
 		}
 		occurred, err := time.Parse(timeLayout, occurredAt)
@@ -375,7 +403,7 @@ func (s *Store) Pending() ([]PendingRow, error) {
 		out = append(out, PendingRow{
 			Event: event.Event{
 				ID: id, OccurredAt: occurred, EventType: eventType, Actor: actor,
-				Content: json.RawMessage(content), Refs: json.RawMessage(refs),
+				Content: json.RawMessage(content), Refs: json.RawMessage(refs), ResourceURI: resourceURI,
 			},
 			LocalCreated: decodeLocalCreated(localCreated),
 			LastError:    lastError.String,
@@ -485,17 +513,17 @@ func (s *Store) ApplyRemoteBatch(rows []RemoteEvent, newCursor int64) error {
 			return fmt.Errorf("local: applying remote event %s: %w", r.Event.ID, err)
 		}
 
-		var occurredAt, eventType, content, refs string
+		var occurredAt, eventType, content, refs, resourceURI string
 		err := tx.QueryRow(
-			`SELECT occurred_at, event_type, content, refs FROM local_events WHERE id = ?`, r.Event.ID,
-		).Scan(&occurredAt, &eventType, &content, &refs)
+			`SELECT occurred_at, event_type, content, refs, resource_uri FROM local_events WHERE id = ?`, r.Event.ID,
+		).Scan(&occurredAt, &eventType, &content, &refs, &resourceURI)
 		switch {
 		case err == sql.ErrNoRows:
 			_, err = tx.Exec(
-				`INSERT INTO local_events(id, occurred_at, event_type, actor, content, refs, local_created, remote_sequence, synced_at)
-				 VALUES (?,?,?,?,?,?,?,?,?)`,
+				`INSERT INTO local_events(id, occurred_at, event_type, actor, content, refs, resource_uri, local_created, remote_sequence, synced_at)
+				 VALUES (?,?,?,?,?,?,?,?,?,?)`,
 				r.Event.ID, r.Event.OccurredAt.UTC().Format(timeLayout), r.Event.EventType, r.Event.Actor,
-				string(r.Event.Content), string(r.Event.Refs), encodeLocalCreated(time.Now()),
+				string(r.Event.Content), string(r.Event.Refs), r.Event.ResourceURI, encodeLocalCreated(time.Now()),
 				r.Sequence, now,
 			)
 			if err != nil {
@@ -523,9 +551,9 @@ func (s *Store) ApplyRemoteBatch(rows []RemoteEvent, newCursor int64) error {
 			// misreported as a payload collision.
 			sameOccurredAt := storedOccurredAt.Truncate(time.Microsecond).Equal(r.Event.OccurredAt.UTC().Truncate(time.Microsecond))
 			same := sameOccurredAt &&
-				eventType == r.Event.EventType && contentEqual && refsEqual
+				eventType == r.Event.EventType && contentEqual && refsEqual && resourceURI == r.Event.ResourceURI
 			if !same {
-				return fmt.Errorf("local: applying remote event %s: local row has different occurred_at/event_type/content/refs than canonical", r.Event.ID)
+				return fmt.Errorf("local: applying remote event %s: local row has different occurred_at/event_type/content/refs/resource_uri than canonical", r.Event.ID)
 			}
 			if _, err := tx.Exec(
 				`UPDATE local_events SET actor = ?, remote_sequence = ?, synced_at = ? WHERE id = ? AND synced_at IS NULL`,

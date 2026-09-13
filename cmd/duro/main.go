@@ -97,6 +97,7 @@ func runAppend(args []string) error {
 	actor := fs.String("actor", "", "actor claim; canonical storage binds new IDs to the authenticated PostgreSQL role")
 	content := fs.String("content", "", "event content, a JSON object")
 	refs := fs.String("refs", "", "event refs, a JSON object")
+	resourceURI := fs.String("resource-uri", "", "optional absolute logical resource URI")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -108,7 +109,7 @@ func runAppend(args []string) error {
 	if *refs != "" {
 		refsJSON = json.RawMessage(*refs)
 	}
-	ev, err := event.New("", *eventType, actorName(*actor), time.Time{}, json.RawMessage(*content), refsJSON)
+	ev, err := event.NewWithResourceURI("", *eventType, actorName(*actor), time.Time{}, json.RawMessage(*content), refsJSON, *resourceURI)
 	if err != nil {
 		return err
 	}
@@ -135,6 +136,7 @@ func runFile(args []string) error {
 	localPath := fs.String("local", "", "local SQLite queue path")
 	bodyPath := fs.String("body", "", "document body file")
 	source := fs.String("source", "", "source reference")
+	resourceURI := fs.String("resource-uri", "", "optional absolute logical resource URI")
 	eventType := fs.String("type", "document.filed", "event type")
 	mediaType := fs.String("media-type", "", "body media type")
 	blobStore := fs.String("blob-store", blobconfig.PostgresKind, "canonical blob store: postgres or filesystem")
@@ -168,7 +170,7 @@ func runFile(args []string) error {
 			return fmt.Errorf("--occurred-at: %w", err)
 		}
 	}
-	ev, err := event.New(*id, *eventType, actorName(*actor), when, content, nil)
+	ev, err := event.NewWithResourceURI(*id, *eventType, actorName(*actor), when, content, nil, *resourceURI)
 	if err != nil {
 		return err
 	}
@@ -313,13 +315,14 @@ func runPull(args []string) error {
 }
 
 type readResult struct {
-	Found      bool   `json:"found"`
-	Sequence   int64  `json:"sequence,omitempty"`
-	EventID    string `json:"event_id,omitempty"`
-	Source     string `json:"source,omitempty"`
-	BlobSHA256 string `json:"blob_sha256,omitempty"`
-	MediaType  string `json:"media_type,omitempty"`
-	Body       string `json:"body,omitempty"`
+	Found       bool   `json:"found"`
+	Sequence    int64  `json:"sequence,omitempty"`
+	EventID     string `json:"event_id,omitempty"`
+	Source      string `json:"source,omitempty"`
+	ResourceURI string `json:"resource_uri,omitempty"`
+	BlobSHA256  string `json:"blob_sha256,omitempty"`
+	MediaType   string `json:"media_type,omitempty"`
+	Body        string `json:"body,omitempty"`
 }
 
 func runRead(args []string) error {
@@ -363,7 +366,7 @@ func runRead(args []string) error {
 		return fmt.Errorf("document %s is not UTF-8 text", doc.EventID)
 	}
 	return json.NewEncoder(os.Stdout).Encode(readResult{
-		Found: true, Sequence: doc.Sequence, EventID: doc.EventID, Source: doc.Source,
+		Found: true, Sequence: doc.Sequence, EventID: doc.EventID, Source: doc.Source, ResourceURI: doc.ResourceURI,
 		BlobSHA256: doc.BlobSHA256, MediaType: doc.MediaType, Body: string(doc.Body),
 	})
 }
@@ -396,7 +399,7 @@ func runList(args []string) error {
 	}{Cursor: *after}
 	for _, doc := range docs {
 		result.Documents = append(result.Documents, readResult{
-			Found: true, Sequence: doc.Sequence, EventID: doc.EventID, Source: doc.Source,
+			Found: true, Sequence: doc.Sequence, EventID: doc.EventID, Source: doc.Source, ResourceURI: doc.ResourceURI,
 			BlobSHA256: doc.BlobSHA256, MediaType: doc.MediaType,
 		})
 		result.Cursor = doc.Sequence

@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS local_events (
     actor           TEXT NOT NULL,
     content         TEXT NOT NULL,
     refs            TEXT NOT NULL,
+    resource_uri    TEXT NOT NULL DEFAULT '',
     local_created   INTEGER NOT NULL,
     remote_sequence INTEGER,
     synced_at       TEXT,

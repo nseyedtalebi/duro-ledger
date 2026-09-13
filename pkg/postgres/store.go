@@ -159,9 +159,9 @@ func (s *Store) Insert(ev event.Event) (Outcome, int64, error) {
 
 	var seq int64
 	err = tx.QueryRow(
-		`INSERT INTO events(id, occurred_at, event_type, actor, content, refs)
-		 VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO NOTHING RETURNING sequence`,
-		ev.ID, ev.OccurredAt.UTC(), ev.EventType, ev.Actor, []byte(ev.Content), []byte(ev.Refs),
+		`INSERT INTO events(id, occurred_at, event_type, actor, content, refs, resource_uri)
+		 VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7, '')) ON CONFLICT (id) DO NOTHING RETURNING sequence`,
+		ev.ID, ev.OccurredAt.UTC(), ev.EventType, ev.Actor, []byte(ev.Content), []byte(ev.Refs), ev.ResourceURI,
 	).Scan(&seq)
 	switch {
 	case err == nil:
@@ -179,9 +179,10 @@ func (s *Store) Insert(ev event.Event) (Outcome, int64, error) {
 	var occurredAt time.Time
 	var eventType, actor string
 	var content, refs []byte
+	var resourceURI string
 	if err := tx.QueryRow(
-		`SELECT sequence, occurred_at, event_type, actor, content, refs FROM events WHERE id = $1`, ev.ID,
-	).Scan(&existingSeq, &occurredAt, &eventType, &actor, &content, &refs); err != nil {
+		`SELECT sequence, occurred_at, event_type, actor, content, refs, COALESCE(resource_uri, '') FROM events WHERE id = $1`, ev.ID,
+	).Scan(&existingSeq, &occurredAt, &eventType, &actor, &content, &refs, &resourceURI); err != nil {
 		return Rejected, 0, err
 	}
 
@@ -201,7 +202,7 @@ func (s *Store) Insert(ev event.Event) (Outcome, int64, error) {
 	if err != nil {
 		return Rejected, 0, err
 	}
-	if sameOccurredAt && eventType == ev.EventType && actor == canonicalActor && contentEqual && refsEqual {
+	if sameOccurredAt && eventType == ev.EventType && actor == canonicalActor && contentEqual && refsEqual && resourceURI == ev.ResourceURI {
 		return AlreadyPresent, existingSeq, nil
 	}
 	return Conflict, existingSeq, nil
@@ -313,9 +314,9 @@ func (s *Store) InsertWithBlobRef(ev event.Event, digest string, size int64, med
 func insertEventLinkedToBlob(tx *sql.Tx, ev event.Event, digest []byte, mediaType string) (Outcome, int64, error) {
 	var seq int64
 	err := tx.QueryRow(
-		`INSERT INTO events(id, occurred_at, event_type, actor, content, refs, blob_sha256, blob_media_type)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING RETURNING sequence`,
-		ev.ID, ev.OccurredAt.UTC(), ev.EventType, ev.Actor, []byte(ev.Content), []byte(ev.Refs), digest, mediaType,
+		`INSERT INTO events(id, occurred_at, event_type, actor, content, refs, blob_sha256, blob_media_type, resource_uri)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9, '')) ON CONFLICT (id) DO NOTHING RETURNING sequence`,
+		ev.ID, ev.OccurredAt.UTC(), ev.EventType, ev.Actor, []byte(ev.Content), []byte(ev.Refs), digest, mediaType, ev.ResourceURI,
 	).Scan(&seq)
 	switch {
 	case err == nil:
@@ -335,11 +336,12 @@ func insertEventLinkedToBlob(tx *sql.Tx, ev event.Event, digest []byte, mediaTyp
 	var eventType, actor string
 	var content, refs, existingDigest []byte
 	var existingMediaType sql.NullString
+	var resourceURI string
 	if err := tx.QueryRow(
 		`SELECT e.sequence, e.occurred_at, e.event_type, e.actor, e.content, e.refs, e.blob_sha256,
-		        COALESCE(e.blob_media_type, b.media_type)
+		        COALESCE(e.blob_media_type, b.media_type), COALESCE(e.resource_uri, '')
 		 FROM events e LEFT JOIN blobs b ON b.sha256 = e.blob_sha256 WHERE e.id = $1`, ev.ID,
-	).Scan(&existingSeq, &occurredAt, &eventType, &actor, &content, &refs, &existingDigest, &existingMediaType); err != nil {
+	).Scan(&existingSeq, &occurredAt, &eventType, &actor, &content, &refs, &existingDigest, &existingMediaType, &resourceURI); err != nil {
 		return Rejected, 0, err
 	}
 
@@ -357,7 +359,7 @@ func insertEventLinkedToBlob(tx *sql.Tx, ev event.Event, digest []byte, mediaTyp
 	if err != nil {
 		return Rejected, 0, err
 	}
-	if sameOccurredAt && eventType == ev.EventType && actor == canonicalActor && contentEqual && refsEqual && sameBlob {
+	if sameOccurredAt && eventType == ev.EventType && actor == canonicalActor && contentEqual && refsEqual && sameBlob && resourceURI == ev.ResourceURI {
 		return AlreadyPresent, existingSeq, nil
 	}
 	return Conflict, existingSeq, nil
@@ -374,12 +376,13 @@ type Blob struct {
 // Document is the newest source-addressed document.filed event together with
 // its verified canonical text bytes.
 type Document struct {
-	Sequence   int64
-	EventID    string
-	Source     string
-	BlobSHA256 string
-	MediaType  string
-	Body       []byte
+	Sequence    int64
+	EventID     string
+	Source      string
+	ResourceURI string
+	BlobSHA256  string
+	MediaType   string
+	Body        []byte
 }
 
 // PulledEvent pairs a canonical event with the sequence it was assigned and,
@@ -456,14 +459,14 @@ func (s *Store) ReadLatestDocumentMetadata(source string) (Document, bool, error
 	var doc Document
 	var digest []byte
 	err := s.db.QueryRow(
-		`SELECT e.sequence, e.id, e.content->>'source', e.blob_sha256,
+		`SELECT e.sequence, e.id, e.content->>'source', COALESCE(e.resource_uri, ''), e.blob_sha256,
 		        COALESCE(e.blob_media_type, b.media_type)
 		 FROM events e JOIN blobs b ON b.sha256 = e.blob_sha256
 		 WHERE e.event_type = 'document.filed'
 		   AND e.content->>'source' = $1
 		 ORDER BY e.sequence DESC LIMIT 1`,
 		source,
-	).Scan(&doc.Sequence, &doc.EventID, &doc.Source, &digest, &doc.MediaType)
+	).Scan(&doc.Sequence, &doc.EventID, &doc.Source, &doc.ResourceURI, &digest, &doc.MediaType)
 	if err == sql.ErrNoRows {
 		return Document{}, false, nil
 	}
@@ -518,7 +521,7 @@ func (s *Store) ListLatestDocuments(after int64, limit int) ([]Document, error) 
 
 	rows, err := s.db.Query(
 		`WITH current_documents AS (
-			SELECT DISTINCT ON (content->>'source') sequence, id, content->>'source' AS source, blob_sha256, blob_media_type
+			SELECT DISTINCT ON (content->>'source') sequence, id, content->>'source' AS source, resource_uri, blob_sha256, blob_media_type
 			FROM events
 			WHERE event_type = 'document.filed'
 			  AND blob_sha256 IS NOT NULL
@@ -526,7 +529,7 @@ func (s *Store) ListLatestDocuments(after int64, limit int) ([]Document, error) 
 			  AND content->>'source' <> ''
 			ORDER BY content->>'source', sequence DESC
 		)
-		SELECT d.sequence, d.id, d.source, d.blob_sha256, COALESCE(d.blob_media_type, b.media_type)
+		SELECT d.sequence, d.id, d.source, COALESCE(d.resource_uri, ''), d.blob_sha256, COALESCE(d.blob_media_type, b.media_type)
 		FROM current_documents d
 		JOIN blobs b ON b.sha256 = d.blob_sha256
 		WHERE d.sequence > $1
@@ -544,7 +547,7 @@ func (s *Store) ListLatestDocuments(after int64, limit int) ([]Document, error) 
 		var doc Document
 		var digest []byte
 		var mediaType sql.NullString
-		if err := rows.Scan(&doc.Sequence, &doc.EventID, &doc.Source, &digest, &mediaType); err != nil {
+		if err := rows.Scan(&doc.Sequence, &doc.EventID, &doc.Source, &doc.ResourceURI, &digest, &mediaType); err != nil {
 			return nil, err
 		}
 		doc.BlobSHA256 = hex.EncodeToString(digest)
@@ -572,7 +575,7 @@ func (s *Store) ListEventsByTypeAndScope(types []string, deploymentScope string,
 		seen[eventType] = struct{}{}
 	}
 	rows, err := s.db.Query(
-		`SELECT sequence, id, occurred_at, event_type, actor, content, refs, blob_sha256
+		`SELECT sequence, id, occurred_at, event_type, actor, content, refs, resource_uri, blob_sha256
 		 FROM events
 		 WHERE event_type = ANY($1::text[]) AND content->>'deployment_scope' = $2 AND sequence > $3
 		 ORDER BY sequence ASC LIMIT $4`, types, deploymentScope, after, limit,
@@ -587,11 +590,12 @@ func (s *Store) ListEventsByTypeAndScope(types []string, deploymentScope string,
 		var id, eventType, actor string
 		var occurredAt time.Time
 		var content, refs, blobDigest []byte
-		if err := rows.Scan(&row.Sequence, &id, &occurredAt, &eventType, &actor, &content, &refs, &blobDigest); err != nil {
+		var resourceURI sql.NullString
+		if err := rows.Scan(&row.Sequence, &id, &occurredAt, &eventType, &actor, &content, &refs, &resourceURI, &blobDigest); err != nil {
 			return nil, err
 		}
 		row.BlobSHA256 = hex.EncodeToString(blobDigest)
-		row.Event = event.Event{ID: id, OccurredAt: occurredAt, EventType: eventType, Actor: actor, Content: json.RawMessage(content), Refs: json.RawMessage(refs)}
+		row.Event = event.Event{ID: id, OccurredAt: occurredAt, EventType: eventType, Actor: actor, Content: json.RawMessage(content), Refs: json.RawMessage(refs), ResourceURI: resourceURI.String}
 		out = append(out, row)
 	}
 	return out, rows.Err()
@@ -602,7 +606,7 @@ func (s *Store) ListEventsByTypeAndScope(types []string, deploymentScope string,
 // or concurrent writers) are allowed and never backfilled.
 func (s *Store) Pull(after int64, limit int) ([]PulledEvent, error) {
 	rows, err := s.db.Query(
-		`SELECT sequence, id, occurred_at, event_type, actor, content, refs, blob_sha256
+		`SELECT sequence, id, occurred_at, event_type, actor, content, refs, resource_uri, blob_sha256
 		 FROM events WHERE sequence > $1 ORDER BY sequence ASC LIMIT $2`,
 		after, limit,
 	)
@@ -617,7 +621,8 @@ func (s *Store) Pull(after int64, limit int) ([]PulledEvent, error) {
 		var id, eventType, actor string
 		var occurredAt time.Time
 		var content, refs, blobDigest []byte
-		if err := rows.Scan(&seq, &id, &occurredAt, &eventType, &actor, &content, &refs, &blobDigest); err != nil {
+		var resourceURI sql.NullString
+		if err := rows.Scan(&seq, &id, &occurredAt, &eventType, &actor, &content, &refs, &resourceURI, &blobDigest); err != nil {
 			return nil, err
 		}
 		out = append(out, PulledEvent{
@@ -625,7 +630,7 @@ func (s *Store) Pull(after int64, limit int) ([]PulledEvent, error) {
 			BlobSHA256: hex.EncodeToString(blobDigest),
 			Event: event.Event{
 				ID: id, OccurredAt: occurredAt, EventType: eventType, Actor: actor,
-				Content: json.RawMessage(content), Refs: json.RawMessage(refs),
+				Content: json.RawMessage(content), Refs: json.RawMessage(refs), ResourceURI: resourceURI.String,
 			},
 		})
 	}

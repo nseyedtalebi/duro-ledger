@@ -9,7 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 )
@@ -27,12 +30,21 @@ type Event struct {
 	Actor      string
 	Content    json.RawMessage
 	Refs       json.RawMessage
+	// ResourceURI is optional generic event-time logical resource metadata.
+	// Duro preserves it exactly but never dereferences or interprets it.
+	ResourceURI string
 }
 
 // New builds a validated Event. If id is empty, a UUID is generated. If
 // occurredAt is the zero time, it defaults to now (UTC). Nil or empty
 // content/refs default to an empty JSON object.
 func New(id, eventType, actor string, occurredAt time.Time, content, refs json.RawMessage) (Event, error) {
+	return NewWithResourceURI(id, eventType, actor, occurredAt, content, refs, "")
+}
+
+// NewWithResourceURI builds a validated Event with optional exact event-time
+// logical resource metadata. Existing callers can keep using New.
+func NewWithResourceURI(id, eventType, actor string, occurredAt time.Time, content, refs json.RawMessage, resourceURI string) (Event, error) {
 	if id == "" {
 		id = uuid.NewString()
 	}
@@ -46,7 +58,7 @@ func New(id, eventType, actor string, occurredAt time.Time, content, refs json.R
 		refs = json.RawMessage(`{}`)
 	}
 
-	ev := Event{ID: id, OccurredAt: occurredAt, EventType: eventType, Actor: actor, Content: content, Refs: refs}
+	ev := Event{ID: id, OccurredAt: occurredAt, EventType: eventType, Actor: actor, Content: content, Refs: refs, ResourceURI: resourceURI}
 	if err := ev.Validate(); err != nil {
 		return Event{}, err
 	}
@@ -80,6 +92,12 @@ func (e Event) Validate() error {
 	}
 	if err := validateObjectJSON("refs", e.Refs); err != nil {
 		return err
+	}
+	if e.ResourceURI != "" {
+		parsed, err := url.ParseRequestURI(e.ResourceURI)
+		if err != nil || !parsed.IsAbs() || strings.IndexFunc(e.ResourceURI, unicode.IsSpace) >= 0 {
+			return fmt.Errorf("event: resource_uri must be an absolute URI")
+		}
 	}
 	return nil
 }

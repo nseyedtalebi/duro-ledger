@@ -92,6 +92,7 @@ func TestSchemaDefinesBlobsAndJSONChecks(t *testing.T) {
 		"content     BYTEA,",
 		"ALTER TABLE blobs ALTER COLUMN content DROP NOT NULL;",
 		"blob_media_type TEXT",
+		"resource_uri TEXT",
 		"CHECK (jsonb_typeof(content) = 'object')",
 		"CHECK (jsonb_typeof(refs) = 'object')",
 		"CREATE OR REPLACE FUNCTION duro_bind_event_actor()",
@@ -165,6 +166,53 @@ func TestListEventsByTypeAndScopeFiltersCanonicalPage(t *testing.T) {
 	}
 	if len(rows) != 2 || rows[0].Event.ID != "11111111-1111-1111-1111-111111111111" || rows[1].Event.ID != "22222222-2222-2222-2222-222222222222" {
 		t.Fatalf("scoped rows = %#v", rows)
+	}
+}
+
+func TestResourceURIOrdinaryInsertPullAndChangedRetry(t *testing.T) {
+	s := openTestStore(t)
+	at := time.Date(2026, 9, 12, 20, 0, 0, 0, time.UTC)
+	original, err := event.NewWithResourceURI(evt1ID, "document.filed", "writer", at, json.RawMessage(`{"source":"cura/drawers/example"}`), nil, "cura://palace/wing/room/example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome, sequence, err := s.Insert(original)
+	if err != nil || outcome != Accepted || sequence <= 0 {
+		t.Fatalf("Insert = outcome:%v sequence:%d err:%v", outcome, sequence, err)
+	}
+	outcome, retrySequence, err := s.Insert(original)
+	if err != nil || outcome != AlreadyPresent || retrySequence != sequence {
+		t.Fatalf("exact retry = outcome:%v sequence:%d err:%v", outcome, retrySequence, err)
+	}
+	changed := original
+	changed.ResourceURI = "cura://palace/wing/room/correction"
+	outcome, retrySequence, err = s.Insert(changed)
+	if err != nil || outcome != Conflict || retrySequence != sequence {
+		t.Fatalf("changed URI retry = outcome:%v sequence:%d err:%v", outcome, retrySequence, err)
+	}
+	rows, err := s.Pull(0, 10)
+	if err != nil || len(rows) != 1 || rows[0].Event.ResourceURI != original.ResourceURI {
+		t.Fatalf("Pull = rows:%#v err:%v", rows, err)
+	}
+}
+
+func TestResourceURIBlobInsertChangedRetryConflicts(t *testing.T) {
+	s := openTestStore(t)
+	at := time.Date(2026, 9, 12, 20, 0, 0, 0, time.UTC)
+	original, err := event.NewWithResourceURI(evt1ID, "document.filed", "writer", at, json.RawMessage(`{"source":"cura/drawers/example"}`), nil, "cura://palace/wing/room/example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("canonical body")
+	outcome, sequence, err := s.InsertWithBlob(original, body, blobDigest(body), "text/plain")
+	if err != nil || outcome != Accepted || sequence <= 0 {
+		t.Fatalf("InsertWithBlob = outcome:%v sequence:%d err:%v", outcome, sequence, err)
+	}
+	changed := original
+	changed.ResourceURI = "cura://palace/wing/room/correction"
+	outcome, retrySequence, err := s.InsertWithBlob(changed, body, blobDigest(body), "text/plain")
+	if err != nil || outcome != Conflict || retrySequence != sequence {
+		t.Fatalf("changed URI blob retry = outcome:%v sequence:%d err:%v", outcome, retrySequence, err)
 	}
 }
 

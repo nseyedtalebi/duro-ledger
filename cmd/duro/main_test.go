@@ -73,7 +73,7 @@ func TestFileStagesDocumentBody(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out := runCLI(t, "file", "--local", localPath, "--body", bodyPath, "--source", "notes/example", "--media-type", "text/plain")
+	out := runCLI(t, "file", "--local", localPath, "--body", bodyPath, "--source", "notes/example", "--resource-uri", "cura://palace/wing/room/example", "--media-type", "text/plain")
 	var got appendResult
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatalf("bad json: %v\\n%s", err, out)
@@ -87,15 +87,18 @@ func TestFileStagesDocumentBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	var eventType, content, mediaType string
+	var eventType, content, resourceURI, mediaType string
 	var size int64
 	var body []byte
-	if err := db.QueryRow(`SELECT e.event_type, e.content, b.media_type, b.size_bytes, b.content
-		FROM local_events e JOIN local_blobs b ON b.event_id = e.id WHERE e.id = ?`, got.EventID).Scan(&eventType, &content, &mediaType, &size, &body); err != nil {
+	if err := db.QueryRow(`SELECT e.event_type, e.content, e.resource_uri, b.media_type, b.size_bytes, b.content
+		FROM local_events e JOIN local_blobs b ON b.event_id = e.id WHERE e.id = ?`, got.EventID).Scan(&eventType, &content, &resourceURI, &mediaType, &size, &body); err != nil {
 		t.Fatal(err)
 	}
 	if eventType != "document.filed" || content != `{"source":"notes/example"}` {
 		t.Fatalf("event = type %q content %q", eventType, content)
+	}
+	if resourceURI != "cura://palace/wing/room/example" {
+		t.Fatalf("resource URI = %q", resourceURI)
 	}
 	if mediaType != "text/plain" || size != int64(len("canonical body")) || string(body) != "canonical body" {
 		t.Fatalf("blob = media_type %q size %d content %q", mediaType, size, body)
@@ -311,17 +314,21 @@ func TestListReturnsCurrentCanonicalDocumentMetadata(t *testing.T) {
 	dir := t.TempDir()
 	localPath := filepath.Join(dir, "local.sqlite")
 	for _, doc := range []struct {
-		name, source, body string
+		name, source, body, resourceURI string
 	}{
-		{"alpha-old", "example/drawers/alpha", "alpha-old"},
-		{"beta", "example/drawers/beta", "beta"},
-		{"alpha-new", "example/drawers/alpha", "alpha-new"},
+		{"alpha-old", "example/drawers/alpha", "alpha-old", ""},
+		{"beta", "example/drawers/beta", "beta", "cura://palace/wing/room/beta"},
+		{"alpha-new", "example/drawers/alpha", "alpha-new", ""},
 	} {
 		bodyPath := filepath.Join(dir, doc.name+".txt")
 		if err := os.WriteFile(bodyPath, []byte(doc.body), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		runCLI(t, "file", "--local", localPath, "--body", bodyPath, "--source", doc.source, "--media-type", "text/plain")
+		args := []string{"file", "--local", localPath, "--body", bodyPath, "--source", doc.source, "--media-type", "text/plain"}
+		if doc.resourceURI != "" {
+			args = append(args, "--resource-uri", doc.resourceURI)
+		}
+		runCLI(t, args...)
 		runCLI(t, "sync", "--local", localPath, "--postgres", dsn)
 	}
 
@@ -340,6 +347,9 @@ func TestListReturnsCurrentCanonicalDocumentMetadata(t *testing.T) {
 		if !doc.Found || doc.EventID == "" || doc.BlobSHA256 == "" || doc.MediaType != "text/plain" || doc.Body != "" {
 			t.Fatalf("listed document = %+v, want metadata with canonical provenance only", doc)
 		}
+	}
+	if got.Documents[0].ResourceURI != "cura://palace/wing/room/beta" || got.Documents[1].ResourceURI != "" {
+		t.Fatalf("listed resource URIs = %#v", got.Documents)
 	}
 	if got.Cursor != got.Documents[1].Sequence {
 		t.Fatalf("cursor = %d, want final sequence %d", got.Cursor, got.Documents[1].Sequence)

@@ -41,6 +41,9 @@ ALTER TABLE events ADD COLUMN IF NOT EXISTS blob_sha256 BYTEA REFERENCES blobs(s
 -- Blob bytes are deduplicated, but their requested media type belongs to the
 -- event: identical bytes can represent different documents.
 ALTER TABLE events ADD COLUMN IF NOT EXISTS blob_media_type TEXT;
+-- Optional event-time logical resource metadata. Duro preserves opaque absolute
+-- URIs; individual projects own scheme/path grammar and reader semantics.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS resource_uri TEXT;
 
 -- New canonical IDs receive their actor from the authenticated PostgreSQL
 -- role. Existing IDs retain their historical actor during idempotent retries.

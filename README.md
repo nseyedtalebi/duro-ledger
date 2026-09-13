@@ -18,8 +18,8 @@ exact opaque bytes use the blob path.
 ## Commands
 
 ```sh
-duro append --local PATH --type TYPE --content JSON [--refs JSON]
-duro file --local PATH --body FILE --source REFERENCE [--type EVENT_TYPE] [--media-type TYPE] [--id EVENT_UUID] [--occurred-at RFC3339] [--blob-store postgres|filesystem] [--blob-root ABSOLUTE_PATH]
+duro append --local PATH --type TYPE --content JSON [--refs JSON] [--resource-uri ABSOLUTE_URI]
+duro file --local PATH --body FILE --source REFERENCE [--resource-uri ABSOLUTE_URI] [--type EVENT_TYPE] [--media-type TYPE] [--id EVENT_UUID] [--occurred-at RFC3339] [--blob-store postgres|filesystem] [--blob-root ABSOLUTE_PATH]
 duro init --postgres ADMIN_DSN
 duro sync --local PATH --postgres DSN [--blob-store postgres|filesystem] [--blob-root ABSOLUTE_PATH]
 duro pull --local PATH --postgres DSN

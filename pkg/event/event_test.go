@@ -34,6 +34,17 @@ func TestNewPreservesProvidedID(t *testing.T) {
 	}
 }
 
+func TestNewWithResourceURIPreservesAbsoluteURI(t *testing.T) {
+	const resourceURI = "cura://palace/wing/room/drawer-id"
+	ev, err := NewWithResourceURI(validID, "document.filed", "writer", time.Now(), json.RawMessage(`{}`), nil, resourceURI)
+	if err != nil {
+		t.Fatalf("NewWithResourceURI: %v", err)
+	}
+	if ev.ResourceURI != resourceURI {
+		t.Fatalf("resource URI = %q, want %q", ev.ResourceURI, resourceURI)
+	}
+}
+
 func TestNewRejectsMalformedID(t *testing.T) {
 	if _, err := New("not-a-uuid", "example.note.created", "writer", time.Now(), nil, nil); err == nil {
 		t.Fatal("expected error for malformed provided id")
@@ -140,5 +151,27 @@ func TestValidateRejectsEmptyID(t *testing.T) {
 	ev := Event{ID: "", EventType: "t", Actor: "a", OccurredAt: time.Now(), Content: json.RawMessage(`{}`), Refs: json.RawMessage(`{}`)}
 	if err := ev.Validate(); err == nil {
 		t.Fatal("expected error for empty id")
+	}
+}
+
+func TestValidateResourceURIRequiresAbsoluteURIAndPreservesExactValue(t *testing.T) {
+	for _, resourceURI := range []string{
+		"cura://palace/wing/room/drawer-id",
+		"rador://deliveries/2026-09-12",
+		"urn:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	} {
+		ev := Event{ID: validID, EventType: "document.filed", Actor: "writer", OccurredAt: time.Now(), Content: json.RawMessage(`{}`), Refs: json.RawMessage(`{}`), ResourceURI: resourceURI}
+		if err := ev.Validate(); err != nil {
+			t.Fatalf("Validate(%q): %v", resourceURI, err)
+		}
+		if ev.ResourceURI != resourceURI {
+			t.Fatalf("resource URI changed from %q to %q", resourceURI, ev.ResourceURI)
+		}
+	}
+	for _, resourceURI := range []string{"relative/path", "/absolute/path-without-scheme", "https://example.invalid/a b", "\nhttps://example.invalid", "https://example.invalid/\x00"} {
+		ev := Event{ID: validID, EventType: "document.filed", Actor: "writer", OccurredAt: time.Now(), Content: json.RawMessage(`{}`), Refs: json.RawMessage(`{}`), ResourceURI: resourceURI}
+		if err := ev.Validate(); err == nil {
+			t.Fatalf("Validate(%q) accepted invalid resource URI", resourceURI)
+		}
 	}
 }

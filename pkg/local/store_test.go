@@ -65,6 +65,96 @@ func TestEnqueueAndPending(t *testing.T) {
 	}
 }
 
+func TestEnqueueRoundTripsResourceURIAndChangedURIConflicts(t *testing.T) {
+	s := open(t)
+	at := time.Date(2026, 9, 12, 20, 0, 0, 0, time.UTC)
+	first, err := event.New(evt1ID, "document.filed", "tester", at, json.RawMessage(`{"source":"cura/drawers/example"}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.ResourceURI = "cura://palace/wing/room/example"
+	if err := first.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Enqueue(first); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	pending, err := s.Pending()
+	if err != nil || len(pending) != 1 || pending[0].Event.ResourceURI != first.ResourceURI {
+		t.Fatalf("pending resource URI = %#v, err=%v", pending, err)
+	}
+
+	changed := first
+	changed.ResourceURI = "cura://palace/wing/room/correction"
+	if _, err := s.Enqueue(changed); !errors.Is(err, ErrConflict) {
+		t.Fatalf("changed resource URI error = %v, want ErrConflict", err)
+	}
+}
+
+func TestEnqueueResourceURISurvivesCloseReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "local.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, err := event.NewWithResourceURI(evt1ID, "document.filed", "tester", time.Date(2026, 9, 12, 20, 0, 0, 0, time.UTC), json.RawMessage(`{"source":"cura/drawers/example"}`), nil, "cura://palace/wing/room/example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Enqueue(ev); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	pending, err := s.Pending()
+	if err != nil || len(pending) != 1 || pending[0].Event.ResourceURI != ev.ResourceURI {
+		t.Fatalf("reopened pending = %#v, err=%v", pending, err)
+	}
+}
+
+func TestOpenMigratesExistingQueueWithEmptyResourceURI(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE local_events (
+		id TEXT PRIMARY KEY, occurred_at TEXT NOT NULL, event_type TEXT NOT NULL, actor TEXT NOT NULL,
+		content TEXT NOT NULL, refs TEXT NOT NULL, local_created INTEGER NOT NULL,
+		remote_sequence INTEGER, synced_at TEXT, last_error TEXT
+	)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO local_events(id, occurred_at, event_type, actor, content, refs, local_created)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, evt1ID, "2026-09-12T20:00:00Z", "document.filed", "legacy", `{"source":"legacy"}`, `{}`, 1); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open legacy queue: %v", err)
+	}
+	defer s.Close()
+	pending, err := s.Pending()
+	if err != nil || len(pending) != 1 || pending[0].Event.ResourceURI != "" {
+		t.Fatalf("legacy pending event = %#v, err=%v", pending, err)
+	}
+	var resourceURI string
+	if err := s.db.QueryRow(`SELECT resource_uri FROM local_events WHERE id = ?`, evt1ID).Scan(&resourceURI); err != nil || resourceURI != "" {
+		t.Fatalf("resource URI migration = %q, err=%v", resourceURI, err)
+	}
+}
+
 func TestEnqueueDuplicateSameContentIsNoop(t *testing.T) {
 	s := open(t)
 	ev := mustEvent(t, evt1ID, `{"a":1}`)
