@@ -448,6 +448,38 @@ func (s *Store) readBlob(digestText string, maxBytes int64) (Blob, bool, error) 
 	return blob, true, nil
 }
 
+// ReadBlobMetadata returns canonical blob provenance without loading its body.
+// Filesystem-backed projectors use it to verify external bytes against the
+// size and digest PostgreSQL accepted for an event.
+func (s *Store) ReadBlobMetadata(digestText string) (Blob, bool, error) {
+	if len(digestText) != sha256.Size*2 {
+		return Blob{}, false, fmt.Errorf("postgres: SHA-256 digest must be %d hex characters", sha256.Size*2)
+	}
+	digest, err := hex.DecodeString(digestText)
+	if err != nil || len(digest) != sha256.Size {
+		return Blob{}, false, fmt.Errorf("postgres: invalid SHA-256 digest %q", digestText)
+	}
+
+	var storedDigest []byte
+	var mediaType sql.NullString
+	var blob Blob
+	err = s.db.QueryRow(`SELECT sha256, media_type, size_bytes FROM blobs WHERE sha256 = $1`, digest).Scan(
+		&storedDigest, &mediaType, &blob.Size,
+	)
+	if err == sql.ErrNoRows {
+		return Blob{}, false, nil
+	}
+	if err != nil {
+		return Blob{}, false, err
+	}
+	if !bytes.Equal(storedDigest, digest) {
+		return Blob{}, false, fmt.Errorf("postgres: blob %s digest mismatch", digestText)
+	}
+	blob.SHA256 = hex.EncodeToString(storedDigest)
+	blob.MediaType = mediaType.String
+	return blob, true, nil
+}
+
 // ReadLatestDocumentMetadata returns provenance for the most recently accepted
 // document.filed event for source without reading blob bytes. Source is opaque
 // to Duro; choosing the highest sequence is the caller-visible "newest source

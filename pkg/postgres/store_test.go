@@ -169,6 +169,21 @@ func TestListEventsByTypeAndScopeFiltersCanonicalPage(t *testing.T) {
 	}
 }
 
+func TestReadBlobMetadataReturnsVerifiedMetadataWithoutContent(t *testing.T) {
+	s := openTestStore(t)
+	body := []byte("canonical body")
+	if outcome, _, err := s.InsertWithBlob(mustEvent(t, evt1ID, `{"source":"cura/drawers/example"}`), body, blobDigest(body), "text/plain"); err != nil || outcome != Accepted {
+		t.Fatalf("InsertWithBlob = outcome:%v err:%v", outcome, err)
+	}
+	metadata, ok, err := s.ReadBlobMetadata(blobDigest(body))
+	if err != nil || !ok {
+		t.Fatalf("ReadBlobMetadata = metadata:%#v ok:%v err:%v", metadata, ok, err)
+	}
+	if metadata.SHA256 != blobDigest(body) || metadata.MediaType != "text/plain" || metadata.Size != int64(len(body)) || metadata.Content != nil {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
 func TestResourceURIOrdinaryInsertPullAndChangedRetry(t *testing.T) {
 	s := openTestStore(t)
 	at := time.Date(2026, 9, 12, 20, 0, 0, 0, time.UTC)
