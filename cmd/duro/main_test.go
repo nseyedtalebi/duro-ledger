@@ -38,6 +38,17 @@ func runCLIErr(t *testing.T, args ...string) ([]byte, error) {
 	return out, err
 }
 
+func TestRootHelpListsCommands(t *testing.T) {
+	for _, args := range [][]string{{"--help"}, {"help"}} {
+		out := string(runCLI(t, args...))
+		for _, want := range []string{"Usage: duro", "init", "append", "file", "sync", "pull", "read", "list", "kg"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("duro %v output %q missing %q", args, out, want)
+			}
+		}
+	}
+}
+
 func TestAppendEnqueuesLocalEvent(t *testing.T) {
 	dir := t.TempDir()
 	localPath := filepath.Join(dir, "local.sqlite")

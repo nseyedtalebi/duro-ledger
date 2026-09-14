@@ -42,6 +42,10 @@ func run(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: duro init|append|file|sync|pull|read|list|kg")
 	}
+	if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+		_, err := fmt.Fprintln(os.Stdout, "Usage: duro init|append|file|sync|pull|read|list|kg")
+		return err
+	}
 	switch args[0] {
 	case "init":
 		return runInit(args[1:])
