@@ -329,6 +329,73 @@ func TestAppendRejectsNonObjectContent(t *testing.T) {
 	}
 }
 
+func TestEventsAndBlobHelpExitZero(t *testing.T) {
+	for _, command := range []string{"events", "blob"} {
+		if out, err := runCLIErr(t, command, "--help"); err != nil || !strings.Contains(string(out), "Usage of "+command+":") {
+			t.Fatalf("%s --help = err %v output %q", command, err, out)
+		}
+	}
+}
+
+func TestEventsRejectsUnexpectedArguments(t *testing.T) {
+	out, err := runCLIErr(t, "events", "--postgres-file", "does-not-exist", "--type", "har.project_log.v1", "--resource-prefix", "cura://har-test/", "unexpected")
+	if err == nil || !strings.Contains(string(out), "unexpected arguments") {
+		t.Fatalf("events trailing argument = err %v output %q", err, out)
+	}
+}
+
+func TestEventsRequiresProtectedDSNFile(t *testing.T) {
+	out, err := runCLIErr(t, "events", "--postgres-file", "does-not-exist", "--type", "har.project_log.v1", "--resource-prefix", "cura://har-test/")
+	if err == nil || !strings.Contains(string(out), "read --postgres-file") {
+		t.Fatalf("events protected DSN requirement = err %v output %q", err, out)
+	}
+}
+
+func TestBlobRequiresProtectedDSNFile(t *testing.T) {
+	out, err := runCLIErr(t, "blob", "--postgres-file", "does-not-exist", "--sha256", strings.Repeat("0", 64), "--max-bytes", "1")
+	if err == nil || !strings.Contains(string(out), "read --postgres-file") {
+		t.Fatalf("blob protected DSN requirement = err %v output %q", err, out)
+	}
+}
+
+func TestEventsAndBlobReadGenericCanonicalBodyThroughProtectedFile(t *testing.T) {
+	dsn := testPostgresDSN(t)
+	dir := t.TempDir()
+	dsnFile := filepath.Join(dir, "postgres.dsn")
+	if err := os.WriteFile(dsnFile, []byte(dsn+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	localPath := filepath.Join(dir, "local.sqlite")
+	body := []byte(`{"ts":"2026-09-20","type":"session","id":"generic-read"}` + "\n")
+	bodyPath := filepath.Join(dir, "event.json")
+	if err := os.WriteFile(bodyPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prefix := "cura://har-test/events-blob/"
+	runCLI(t, "file", "--local", localPath, "--body", bodyPath, "--source", "har-test/events-blob", "--resource-uri", prefix+"event", "--type", "har.project_log.v1", "--media-type", "application/json")
+	runCLI(t, "sync", "--local", localPath, "--postgres", dsn)
+
+	out := runCLI(t, "events", "--postgres-file", dsnFile, "--type", "har.project_log.v1", "--resource-prefix", prefix)
+	var got struct {
+		Events []struct {
+			EventID       string `json:"event_id"`
+			BlobSHA256    string `json:"blob_sha256"`
+			BlobMediaType string `json:"blob_media_type"`
+			BlobSize      int64  `json:"blob_size"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("events JSON: %v\n%s", err, out)
+	}
+	if len(got.Events) != 1 || got.Events[0].EventID == "" || got.Events[0].BlobSHA256 == "" || got.Events[0].BlobMediaType != "application/json" || got.Events[0].BlobSize != int64(len(body)) {
+		t.Fatalf("events result = %+v", got)
+	}
+	blobOut := runCLI(t, "blob", "--postgres-file", dsnFile, "--sha256", got.Events[0].BlobSHA256, "--max-bytes", fmt.Sprint(len(body)))
+	if string(blobOut) != string(body) {
+		t.Fatalf("blob bytes = %q, want %q", blobOut, body)
+	}
+}
+
 func TestReadRequiresSource(t *testing.T) {
 	out, err := runCLIErr(t, "read", "--postgres", "postgresql://example")
 	if err == nil || !strings.Contains(string(out), "--postgres and --source are required") {

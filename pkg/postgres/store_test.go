@@ -724,8 +724,8 @@ func TestPullIncludesBlobProvenanceAndReadBlob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Pull: %v", err)
 	}
-	if len(rows) != 1 || rows[0].BlobSHA256 != digest {
-		t.Fatalf("pulled blob provenance = %#v, want %s", rows, digest)
+	if len(rows) != 1 || rows[0].BlobSHA256 != digest || rows[0].BlobMediaType != "text/plain" || rows[0].BlobSize != int64(len(content)) {
+		t.Fatalf("pulled blob provenance = %#v, want %s/text/plain/%d", rows, digest, len(content))
 	}
 
 	blob, ok, err := s.ReadBlob(digest)

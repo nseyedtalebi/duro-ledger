@@ -8,13 +8,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"mime"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -34,6 +37,9 @@ const defaultPullBatch = 500
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -41,10 +47,10 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: duro init|append|file|sync|pull|read|list|kg")
+		return fmt.Errorf("usage: duro init|append|file|sync|pull|read|list|events|blob|kg")
 	}
 	if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
-		_, err := fmt.Fprintln(os.Stdout, "Usage: duro init|append|file|sync|pull|read|list|kg")
+		_, err := fmt.Fprintln(os.Stdout, "Usage: duro init|append|file|sync|pull|read|list|events|blob|kg")
 		return err
 	}
 	switch args[0] {
@@ -62,6 +68,10 @@ func run(args []string) error {
 		return runRead(args[1:])
 	case "list":
 		return runList(args[1:])
+	case "events":
+		return runEvents(args[1:])
+	case "blob":
+		return runBlob(args[1:])
 	case "kg":
 		return runKG(args[1:])
 	default:
@@ -248,6 +258,31 @@ func postgresDSN(value, path string) (string, error) {
 	return value, nil
 }
 
+func openProtectedPostgres(path string) (*postgres.Store, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("read --postgres-file: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("invalid --postgres-file")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Geteuid()) {
+		return nil, fmt.Errorf("invalid --postgres-file")
+	}
+	contents, err := io.ReadAll(file)
+	if err != nil || len(strings.TrimSpace(string(contents))) == 0 {
+		return nil, fmt.Errorf("read --postgres-file failed")
+	}
+	store, err := postgres.Open(strings.TrimSpace(string(contents)))
+	if err != nil {
+		return nil, fmt.Errorf("open canonical PostgreSQL store failed")
+	}
+	return store, nil
+}
+
 func runSync(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -308,6 +343,94 @@ func runSync(args []string) error {
 		Conflict:       res.Conflict,
 		Rejected:       res.Rejected,
 	})
+}
+
+type eventsResult struct {
+	Events []eventMetadata `json:"events"`
+	Cursor int64           `json:"cursor"`
+}
+
+type eventMetadata struct {
+	Sequence      int64           `json:"sequence"`
+	EventID       string          `json:"event_id"`
+	OccurredAt    time.Time       `json:"occurred_at"`
+	EventType     string          `json:"event_type"`
+	Actor         string          `json:"actor"`
+	Content       json.RawMessage `json:"content"`
+	Refs          json.RawMessage `json:"refs"`
+	ResourceURI   string          `json:"resource_uri"`
+	BlobSHA256    string          `json:"blob_sha256"`
+	BlobMediaType string          `json:"blob_media_type"`
+	BlobSize      int64           `json:"blob_size"`
+}
+
+func runEvents(args []string) error {
+	fs := flag.NewFlagSet("events", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	postgresFile := fs.String("postgres-file", "", "protected PostgreSQL canonical store DSN file")
+	eventType := fs.String("type", "", "exact canonical event type")
+	resourcePrefix := fs.String("resource-prefix", "", "literal logical resource URI prefix")
+	after := fs.Int64("after", 0, "exclusive canonical sequence cursor")
+	limit := fs.Int("limit", 500, "maximum events")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments")
+	}
+	if *postgresFile == "" || *eventType == "" || *resourcePrefix == "" {
+		return fmt.Errorf("--postgres-file, --type, and --resource-prefix are required")
+	}
+	store, err := openProtectedPostgres(*postgresFile)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	rows, err := store.ListEventsByTypeAndResourcePrefix(*eventType, *resourcePrefix, *after, *limit)
+	if err != nil {
+		return fmt.Errorf("list canonical events failed")
+	}
+	result := eventsResult{Cursor: *after}
+	for _, row := range rows {
+		result.Events = append(result.Events, eventMetadata{
+			Sequence: row.Sequence, EventID: row.Event.ID, OccurredAt: row.Event.OccurredAt, EventType: row.Event.EventType,
+			Actor: row.Event.Actor, Content: row.Event.Content, Refs: row.Event.Refs, ResourceURI: row.Event.ResourceURI,
+			BlobSHA256: row.BlobSHA256, BlobMediaType: row.BlobMediaType, BlobSize: row.BlobSize,
+		})
+		result.Cursor = row.Sequence
+	}
+	return json.NewEncoder(os.Stdout).Encode(result)
+}
+
+func runBlob(args []string) error {
+	fs := flag.NewFlagSet("blob", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	postgresFile := fs.String("postgres-file", "", "protected PostgreSQL canonical store DSN file")
+	digest := fs.String("sha256", "", "canonical blob SHA-256")
+	maxBytes := fs.Int64("max-bytes", 0, "maximum bytes to read")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments")
+	}
+	if *postgresFile == "" || *digest == "" || *maxBytes <= 0 {
+		return fmt.Errorf("--postgres-file, --sha256, and positive --max-bytes are required")
+	}
+	store, err := openProtectedPostgres(*postgresFile)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	body, ok, err := store.ReadBlobLimited(*digest, *maxBytes)
+	if err != nil {
+		return fmt.Errorf("read canonical blob failed")
+	}
+	if !ok {
+		return fmt.Errorf("canonical blob not found")
+	}
+	_, err = os.Stdout.Write(body.Content)
+	return err
 }
 
 type pullResult struct {

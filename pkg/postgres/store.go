@@ -386,11 +386,13 @@ type Document struct {
 }
 
 // PulledEvent pairs a canonical event with the sequence it was assigned and,
-// when present, the SHA-256 digest of its canonical body blob.
+// when present, metadata for its canonical body blob. Bytes remain unread.
 type PulledEvent struct {
-	Sequence   int64
-	Event      event.Event
-	BlobSHA256 string
+	Sequence      int64
+	Event         event.Event
+	BlobSHA256    string
+	BlobMediaType string
+	BlobSize      int64
 }
 
 // ReadBlob returns a canonical blob by digest. It verifies both the stored
@@ -633,15 +635,39 @@ func (s *Store) ListEventsByTypeAndScope(types []string, deploymentScope string,
 	return out, rows.Err()
 }
 
+// ListEventsByTypeAndResourcePrefix returns a bounded, ascending page for one
+// project-owned event type and literal logical-URI prefix. It exposes only
+// canonical metadata; callers read bodies separately through ReadBlobLimited.
+func (s *Store) ListEventsByTypeAndResourcePrefix(eventType, resourcePrefix string, after int64, limit int) ([]PulledEvent, error) {
+	if eventType == "" || resourcePrefix == "" || after < 0 || limit <= 0 || limit > maxDocumentListLimit {
+		return nil, fmt.Errorf("postgres: invalid event query")
+	}
+	prefix := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(resourcePrefix) + "%"
+	return s.queryPulledEvents(
+		`SELECT e.sequence, e.id, e.occurred_at, e.event_type, e.actor, e.content, e.refs, e.resource_uri,
+		        e.blob_sha256, COALESCE(e.blob_media_type, b.media_type), b.size_bytes
+		 FROM events e LEFT JOIN blobs b ON b.sha256 = e.blob_sha256
+		 WHERE e.event_type = $1 AND e.resource_uri LIKE $2 ESCAPE '\' AND e.sequence > $3
+		 ORDER BY e.sequence ASC LIMIT $4`,
+		eventType, prefix, after, limit,
+	)
+}
+
 // Pull returns up to limit canonical events with sequence > after, ordered
 // ascending by sequence. Sequence gaps (from rolled-back inserts, deletes,
 // or concurrent writers) are allowed and never backfilled.
 func (s *Store) Pull(after int64, limit int) ([]PulledEvent, error) {
-	rows, err := s.db.Query(
-		`SELECT sequence, id, occurred_at, event_type, actor, content, refs, resource_uri, blob_sha256
-		 FROM events WHERE sequence > $1 ORDER BY sequence ASC LIMIT $2`,
+	return s.queryPulledEvents(
+		`SELECT e.sequence, e.id, e.occurred_at, e.event_type, e.actor, e.content, e.refs, e.resource_uri,
+		        e.blob_sha256, COALESCE(e.blob_media_type, b.media_type), b.size_bytes
+		 FROM events e LEFT JOIN blobs b ON b.sha256 = e.blob_sha256
+		 WHERE e.sequence > $1 ORDER BY e.sequence ASC LIMIT $2`,
 		after, limit,
 	)
+}
+
+func (s *Store) queryPulledEvents(query string, args ...any) ([]PulledEvent, error) {
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -649,22 +675,20 @@ func (s *Store) Pull(after int64, limit int) ([]PulledEvent, error) {
 
 	var out []PulledEvent
 	for rows.Next() {
-		var seq int64
+		var row PulledEvent
 		var id, eventType, actor string
 		var occurredAt time.Time
 		var content, refs, blobDigest []byte
-		var resourceURI sql.NullString
-		if err := rows.Scan(&seq, &id, &occurredAt, &eventType, &actor, &content, &refs, &resourceURI, &blobDigest); err != nil {
+		var resourceURI, mediaType sql.NullString
+		var blobSize sql.NullInt64
+		if err := rows.Scan(&row.Sequence, &id, &occurredAt, &eventType, &actor, &content, &refs, &resourceURI, &blobDigest, &mediaType, &blobSize); err != nil {
 			return nil, err
 		}
-		out = append(out, PulledEvent{
-			Sequence:   seq,
-			BlobSHA256: hex.EncodeToString(blobDigest),
-			Event: event.Event{
-				ID: id, OccurredAt: occurredAt, EventType: eventType, Actor: actor,
-				Content: json.RawMessage(content), Refs: json.RawMessage(refs), ResourceURI: resourceURI.String,
-			},
-		})
+		row.BlobSHA256 = hex.EncodeToString(blobDigest)
+		row.BlobMediaType = mediaType.String
+		row.BlobSize = blobSize.Int64
+		row.Event = event.Event{ID: id, OccurredAt: occurredAt, EventType: eventType, Actor: actor, Content: json.RawMessage(content), Refs: json.RawMessage(refs), ResourceURI: resourceURI.String}
+		out = append(out, row)
 	}
 	return out, rows.Err()
 }
