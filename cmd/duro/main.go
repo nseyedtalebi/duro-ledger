@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -230,18 +231,48 @@ type syncResult struct {
 	Rejected       int `json:"rejected"`
 }
 
+func postgresDSN(value, path string) (string, error) {
+	if value != "" && path != "" {
+		return "", fmt.Errorf("--postgres and --postgres-file are mutually exclusive")
+	}
+	if path != "" {
+		bytes, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read --postgres-file: %w", err)
+		}
+		value = strings.TrimSpace(string(bytes))
+	}
+	if value == "" {
+		return "", fmt.Errorf("--postgres or --postgres-file is required")
+	}
+	return value, nil
+}
+
 func runSync(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	localPath := fs.String("local", "", "local SQLite queue path")
 	dsn := fs.String("postgres", "", "PostgreSQL canonical store DSN")
+	dsnFile := fs.String("postgres-file", "", "protected file containing the PostgreSQL canonical store DSN")
 	blobStore := fs.String("blob-store", blobconfig.PostgresKind, "canonical blob store: postgres or filesystem")
 	blobRoot := fs.String("blob-root", "", "absolute filesystem blob store root")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *localPath == "" || *dsn == "" {
-		return fmt.Errorf("--local and --postgres are required")
+	if *localPath == "" {
+		return fmt.Errorf("--local is required")
+	}
+	var postgresSet, postgresFileSet bool
+	fs.Visit(func(flag *flag.Flag) {
+		postgresSet = postgresSet || flag.Name == "postgres"
+		postgresFileSet = postgresFileSet || flag.Name == "postgres-file"
+	})
+	if postgresSet && postgresFileSet {
+		return fmt.Errorf("--postgres and --postgres-file are mutually exclusive")
+	}
+	dsnValue, err := postgresDSN(*dsn, *dsnFile)
+	if err != nil {
+		return err
 	}
 	if err := blobconfig.Validate(*blobStore, *blobRoot); err != nil {
 		return err
@@ -252,9 +283,9 @@ func runSync(args []string) error {
 		return err
 	}
 	defer loc.Close()
-	rem, err := postgres.Open(*dsn)
+	rem, err := postgres.Open(dsnValue)
 	if err != nil {
-		return err
+		return fmt.Errorf("open canonical PostgreSQL store failed")
 	}
 	defer rem.Close()
 

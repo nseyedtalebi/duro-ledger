@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,6 +47,56 @@ func TestRootHelpListsCommands(t *testing.T) {
 				t.Fatalf("duro %v output %q missing %q", args, out, want)
 			}
 		}
+	}
+}
+
+func TestPostgresDSNReadsProtectedFile(t *testing.T) {
+	dsnFile := filepath.Join(t.TempDir(), "postgres.dsn")
+	const want = "postgresql://example/duro"
+	if err := os.WriteFile(dsnFile, []byte(want+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := postgresDSN("", dsnFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("DSN = %q, want %q", got, want)
+	}
+}
+
+func TestPostgresDSNRejectsFlagAndFileTogether(t *testing.T) {
+	if _, err := postgresDSN("postgresql://flag", "postgres.dsn"); err == nil {
+		t.Fatal("expected mutually exclusive DSN inputs to fail")
+	}
+}
+
+func TestSyncRejectsExplicitEmptyPostgresWithPostgresFile(t *testing.T) {
+	dir := t.TempDir()
+	dsnFile := filepath.Join(dir, "postgres.dsn")
+	if err := os.WriteFile(dsnFile, []byte("postgresql://example/duro\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runCLIErr(t, "sync", "--local", filepath.Join(dir, "local.sqlite"), "--postgres=", "--postgres-file", dsnFile)
+	if err == nil || !strings.Contains(string(out), "mutually exclusive") {
+		t.Fatalf("sync with both DSN flags = err %v output %q", err, out)
+	}
+}
+
+func TestSyncRedactsInvalidDSNFromProtectedFile(t *testing.T) {
+	dir := t.TempDir()
+	dsnFile := filepath.Join(dir, "postgres.dsn")
+	const sentinel = "redaction-" + "probe"
+	if err := os.WriteFile(dsnFile, []byte(fmt.Sprintf("postgresql://user:%s@%%zz\n", sentinel)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runCLIErr(t, "sync", "--local", filepath.Join(dir, "local.sqlite"), "--postgres-file", dsnFile)
+	if err == nil {
+		t.Fatal("expected invalid protected DSN to fail")
+	}
+	if strings.Contains(string(out), sentinel) {
+		t.Fatalf("sync leaked protected DSN in output %q", out)
 	}
 }
 
