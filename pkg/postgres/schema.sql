@@ -12,6 +12,18 @@ CREATE TABLE IF NOT EXISTS events (
     refs        JSONB NOT NULL CHECK (jsonb_typeof(refs) = 'object')
 );
 
+-- event_type carries the same boundary rule as event.Validate: rejected only
+-- when empty, so a raw SQL insert can't bypass Go and land an untyped
+-- canonical event. PostgreSQL has no ADD CONSTRAINT IF NOT EXISTS; tolerate
+-- a concurrent initializer that added the same named constraint first.
+DO $$
+BEGIN
+    ALTER TABLE events ADD CONSTRAINT events_event_type_nonempty CHECK (event_type <> '');
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END;
+$$;
+
 ALTER TABLE events ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS events_public_baseline ON events;
 CREATE POLICY events_public_baseline ON events AS PERMISSIVE FOR ALL TO PUBLIC USING (true) WITH CHECK (true);

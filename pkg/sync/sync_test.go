@@ -354,6 +354,85 @@ func (failingBlobStore) Verify(digest string, size int64) error {
 }
 func (failingBlobStore) Kind() string { return "failing" }
 
+// verifyingBlobStore stands in for an external CAS that already owns the
+// bytes: Verify vouches for the digest/size, and Put fails so a test can't
+// pass by accidentally routing through the upload path instead of the
+// prestaged-blob path.
+type verifyingBlobStore struct{}
+
+func (verifyingBlobStore) Put(digest string, content []byte) error {
+	return fmt.Errorf("verifyingBlobStore: bytes are owned externally, refusing to write %s", digest)
+}
+func (verifyingBlobStore) Read(digest string, maxBytes int64) ([]byte, error) {
+	return nil, blob.ErrNotFound
+}
+func (verifyingBlobStore) Verify(digest string, size int64) error { return nil }
+func (verifyingBlobStore) Kind() string                          { return "external-cas" }
+
+func TestPushWithPrestagedExternalBlobLinksWhenBackendVerifies(t *testing.T) {
+	loc := openLocal(t)
+	rem := openRemote(t)
+	ev := mustEvent(t, evt1ID, `{"a":1}`)
+	content := []byte("bytes owned by an external CAS")
+	digest := digestOf(content)
+	size := int64(len(content))
+
+	if _, err := loc.EnqueueWithBlobRef(ev, digest, size, "application/octet-stream"); err != nil {
+		t.Fatalf("EnqueueWithBlobRef: %v", err)
+	}
+
+	// A non-filesystem backend whose Verify succeeds is enough: no Kind()
+	// restriction, and Put is never reached for a prestaged blob.
+	res, err := PushWithBlobStore(loc, rem, verifyingBlobStore{}, 10)
+	if err != nil {
+		t.Fatalf("PushWithBlobStore: %v", err)
+	}
+	if res.Accepted != 1 {
+		t.Fatalf("want 1 accepted, got %+v", res)
+	}
+
+	pulled, err := rem.Pull(0, 10)
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	if len(pulled) != 1 || pulled[0].BlobSHA256 != digest {
+		t.Fatalf("canonical row = %#v, want external blob link %s", pulled, digest)
+	}
+}
+
+func TestPushWithPrestagedExternalBlobFailedVerifyRetainsQueue(t *testing.T) {
+	loc := openLocal(t)
+	rem := openRemote(t)
+	ev := mustEvent(t, evt1ID, `{"a":1}`)
+	content := []byte("bytes the backend will not vouch for")
+
+	if _, err := loc.EnqueueWithBlobRef(ev, digestOf(content), int64(len(content)), "application/octet-stream"); err != nil {
+		t.Fatalf("EnqueueWithBlobRef: %v", err)
+	}
+
+	// Dropping the Kind() gate must not drop the verify gate: an unverifiable
+	// prestaged blob is never linked into a canonical event.
+	if _, err := PushWithBlobStore(loc, rem, failingBlobStore{}, 10); err == nil {
+		t.Fatal("want error when the backend cannot verify the prestaged blob")
+	}
+
+	pending, err := loc.Pending()
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("want the row retained pending after a failed verify, got %d", len(pending))
+	}
+
+	pulled, err := rem.Pull(0, 10)
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	if len(pulled) != 0 {
+		t.Fatalf("want no canonical row after a failed verify, got %d", len(pulled))
+	}
+}
+
 func openFilesystemBlobStore(t *testing.T) *blob.FilesystemStore {
 	t.Helper()
 	s, err := blob.NewFilesystemStore(t.TempDir())

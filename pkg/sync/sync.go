@@ -39,17 +39,15 @@ func Push(src *local.Store, dst *postgres.Store, limit int) (PushResult, error) 
 // PushWithBlobStore is Push, but a staged blob's bytes are durably written
 // to backend first, and only then linked into the canonical event via
 // InsertWithBlobRef -- PostgreSQL never sees the blob content itself. A
-// filesystem-prestaged blob is reverified before the same link. If either
-// backend action fails, the row remains pending for retry.
+// prestaged blob is reverified against backend before the same link, so any
+// backend that can vouch for digest and size (an external CAS included) is
+// accepted. If either backend action fails, the row remains pending for retry.
 func PushWithBlobStore(src *local.Store, dst *postgres.Store, backend blob.Store, limit int) (PushResult, error) {
 	return pushRows(src, limit, func(row local.PendingRow, b local.Blob, hasBlob bool) (postgres.Outcome, int64, error) {
 		if !hasBlob {
 			return dst.Insert(row.Event)
 		}
 		if b.External {
-			if backend.Kind() != "filesystem" {
-				return postgres.Rejected, 0, fmt.Errorf("sync: blob %s was staged in filesystem storage; sync requires --blob-store=filesystem", b.SHA256)
-			}
 			if err := backend.Verify(b.SHA256, b.Size); err != nil {
 				return postgres.Rejected, 0, fmt.Errorf("sync: verify prestaged blob %s in %s backend: %w", b.SHA256, backend.Kind(), err)
 			}

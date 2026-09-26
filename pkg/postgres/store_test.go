@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/nseyedtalebi/duro-ledger/pkg/event"
 )
 
@@ -95,6 +97,7 @@ func TestSchemaDefinesBlobsAndJSONChecks(t *testing.T) {
 		"resource_uri TEXT",
 		"CHECK (jsonb_typeof(content) = 'object')",
 		"CHECK (jsonb_typeof(refs) = 'object')",
+		"events_event_type_nonempty CHECK (event_type <> '')",
 		"CREATE OR REPLACE FUNCTION duro_bind_event_actor()",
 		"current_user",
 		"CREATE TRIGGER events_bind_actor",
@@ -276,6 +279,52 @@ func TestInitializeAppliesSchema(t *testing.T) {
 	}
 	if events.String != "events" || blobs.String != "blobs" {
 		t.Fatalf("schema missing tables: events=%q blobs=%q", events.String, blobs.String)
+	}
+}
+
+// The empty-event_type rule lives in the schema, not only in event.Validate,
+// so raw SQL that bypasses Go cannot land an untyped canonical event. Running
+// Initialize twice also pins idempotency against an already-initialized
+// database, where the constraint already exists.
+func TestInitializeRejectsEmptyEventTypeFromRawSQL(t *testing.T) {
+	dsn := os.Getenv("DURO_POSTGRES_TEST_DSN")
+	if dsn == "" {
+		t.Skip("DURO_POSTGRES_TEST_DSN not set; skipping PostgreSQL integration test")
+	}
+	raw, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	raw.SetMaxOpenConns(1)
+	if _, err := raw.Exec(`SELECT pg_advisory_lock($1)`, testAdvisoryLockKey); err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
+
+	if err := Initialize(dsn); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := Initialize(dsn); err != nil {
+		t.Fatalf("Initialize again: %v", err)
+	}
+
+	const insert = `INSERT INTO events(id, occurred_at, event_type, actor, content, refs)
+	                VALUES ($1, now(), $2, 'tester', '{}'::jsonb, '{}'::jsonb)`
+	if _, err := raw.Exec(insert, uuid.NewString(), ""); err == nil {
+		t.Fatal("want the schema to reject an empty event_type inserted by raw SQL")
+	}
+
+	// Only the empty string is rejected, matching event.Validate exactly:
+	// whitespace is still a legal event_type. The whole probe rolls back so
+	// the shared test table is left as it was found.
+	tx, err := raw.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(insert, uuid.NewString(), " "); err != nil {
+		t.Fatalf("whitespace event_type must still be accepted, got: %v", err)
 	}
 }
 
