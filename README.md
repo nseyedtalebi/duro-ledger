@@ -1,19 +1,17 @@
 # Duro
 
-Duro is a small, local, verifiable event ledger.
-
-The active implementation is:
+Duro is a small event ledger for retryable facts and optional verified bytes.
+PostgreSQL is the sole canonical event authority; SQLite is an optional local
+queue for offline work and retry. Duro carries domain meaning in flexible JSON,
+keeps exact bytes in an explicit blob backend, and leaves read models rebuildable.
 
 ```text
-SQLite durable local queue
-  → authenticated PostgreSQL synchronization
-  → PostgreSQL canonical event store
-  → ordered pull/replay boundary
+optional local SQLite queue → PostgreSQL canonical events → ordered replay
+                                      └→ PostgreSQL blobs or filesystem CAS
 ```
 
-PostgreSQL is the sole canonical authority. SQLite is an offline queue and
-optional local replica. Event-specific semantic data lives in JSON objects;
-exact opaque bytes use the blob path.
+Read [the architecture guide](docs/architecture.md) for the authority model,
+design rationale, code-review map, and explicit non-goals.
 
 ## Commands
 
@@ -26,6 +24,9 @@ duro pull --local PATH --postgres DSN
 duro read --postgres DSN --source SOURCE [--max-bytes N] [--blob-store postgres|filesystem] [--blob-root ABSOLUTE_PATH]
 duro list --postgres DSN [--after SEQUENCE] [--limit N]
 duro kg --postgres DSN [--subject S] [--predicate P] [--object O]
+duro artifact put --postgres DSN --blob-root ABSOLUTE_PATH --file PATH [--locator ABSOLUTE_URI ...]
+duro artifact verify --postgres DSN --blob-root ABSOLUTE_PATH --sha256 LOWERCASE_HEX
+duro artifact locate --postgres DSN [--prefix LITERAL_URI_PREFIX]
 ```
 
 Each command emits machine-readable JSON on success. Run `duro init` once with
@@ -40,6 +41,12 @@ small digest metadata for idempotent conflict checks. Use a
 specific event type such as `dataset.filed` or `run.artifact.filed`; the
 default `document.filed` remains for Duro's document reader. This is for
 artifact-level provenance, not one event per dataset row.
+
+`artifact` catalogs filesystem-CAS bytes without creating an event: `put`
+writes verified bytes then records their digest, size, verification time, and
+optional source locator observations; `verify` rehashes one cataloged blob;
+`locate` emits those observations as JSON. Locators are observations, not
+fallback read paths or canonical resource identity.
 
 `kg` is a disposable knowledge-graph projection. It replays
 `knowledge.fact` events from sequence zero, applies reversible
@@ -70,11 +77,11 @@ passwords. Duro does not impose a transport policy: the deployment must keep
 PostgreSQL on an internal network or loopback-only bind and must never expose a
 plaintext listener publicly.
 
-## Canonical blob backend
+## Blob backends
 
-PostgreSQL is the default canonical blob backend. To retain canonical document
-bytes on a filesystem mounted on the Duro host, use the same explicit backend
-selection for both `sync` and `read`:
+PostgreSQL is the default blob backend. To retain canonical document bytes on a
+filesystem mounted on the Duro host, use the same explicit backend selection
+for both `sync` and `read`:
 
 ```sh
 duro sync --local /var/lib/duro/queue.sqlite --postgres DSN \
@@ -83,11 +90,11 @@ duro read --postgres DSN --source urn:example:document:123 \
   --blob-store filesystem --blob-root /srv/duro-blobs
 ```
 
-The root must be absolute. Duro uses a sharded SHA-256 content-addressed layout
-there and verifies a blob's digest before returning it. Keep the SQLite queue
-on local storage; it is a single-writer durable queue, not shared network
-storage. Blossom, blob URIs, and migration between backends are not in this
-slice.
+The root must be absolute. The filesystem backend uses a sharded SHA-256
+content-addressed layout and verifies a blob before returning it. In this mode,
+the filesystem is byte authority while PostgreSQL retains event provenance and
+metadata. Keep SQLite on local storage: it is a single-writer durable queue,
+not shared network storage.
 
 Stop the container while preserving its data with `docker compose down`. Use an
 owner-readable environment file containing a high-entropy
@@ -113,5 +120,6 @@ restricted ordinary-ingest role, and verifies that the role cannot update or
 delete canonical rows. Without that DSN the test is explicitly skipped; a
 superuser connection is not accepted as proof of the authorization boundary.
 
-`pkg/cas` remains as a separate local content-addressed utility; the active
-ledger does not depend on it.
+`pkg/cas` is Duro's native filesystem content-addressed store. Its artifact
+catalog commands intentionally omit destructive reconciliation and multi-store
+replica management until a concrete deployment needs them.
