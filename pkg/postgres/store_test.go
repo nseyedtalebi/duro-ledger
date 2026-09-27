@@ -50,7 +50,7 @@ func openTestStore(t *testing.T) *Store {
 		raw.Close()
 		t.Fatalf("Open: %v", err)
 	}
-	if _, err := s.db.Exec(`TRUNCATE events, blobs RESTART IDENTITY`); err != nil {
+	if _, err := s.db.Exec(`TRUNCATE events, blobs, blob_locator_observations RESTART IDENTITY`); err != nil {
 		s.Close()
 		_, _ = raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
 		raw.Close()

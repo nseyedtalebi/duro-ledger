@@ -175,3 +175,16 @@ func TestValidateResourceURIRequiresAbsoluteURIAndPreservesExactValue(t *testing
 		}
 	}
 }
+
+func TestValidateAbsoluteURI(t *testing.T) {
+	for _, uri := range []string{"file:///data/run-1/output.bin", "https://example.invalid/a", "urn:sha256:abc"} {
+		if err := ValidateAbsoluteURI(uri); err != nil {
+			t.Fatalf("ValidateAbsoluteURI(%q): %v", uri, err)
+		}
+	}
+	for _, uri := range []string{"", "relative/path", "file:///data/a b", "\nhttps://example.invalid"} {
+		if err := ValidateAbsoluteURI(uri); err == nil {
+			t.Fatalf("ValidateAbsoluteURI(%q) = nil error, want rejection", uri)
+		}
+	}
+}

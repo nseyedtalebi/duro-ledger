@@ -46,6 +46,26 @@ CREATE TABLE IF NOT EXISTS blobs (
 -- Idempotent for a database initialized before content became nullable.
 ALTER TABLE blobs ALTER COLUMN content DROP NOT NULL;
 
+-- When this blob's stored bytes were last streamed through their digest and
+-- found intact. NULL means never verified since cataloging; it is operational
+-- metadata about a check, not part of the blob's immutable identity.
+ALTER TABLE blobs ADD COLUMN IF NOT EXISTS last_verified_at TIMESTAMPTZ;
+
+-- Observations of where a blob's bytes were seen physically, many per blob.
+-- These are *source* locators supplied by whoever cataloged the artifact --
+-- never the derived CAS destination path, which is a function of the digest
+-- and the deployment's blob root and so carries no information. Distinct from
+-- events.resource_uri, which is event-time logical metadata rather than an
+-- observation of physical storage. (blob_sha256, locator) is the primary key,
+-- so re-observing the same locator refreshes observed_at instead of appending
+-- a duplicate row.
+CREATE TABLE IF NOT EXISTS blob_locator_observations (
+    blob_sha256 BYTEA NOT NULL REFERENCES blobs(sha256),
+    locator     TEXT NOT NULL CHECK (locator <> ''),
+    observed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (blob_sha256, locator)
+);
+
 -- An event may carry at most one associated blob, referenced by digest
 -- rather than blobs.id so dedup (same bytes, different uploader) never
 -- requires the caller to know which row happened to win the insert race.

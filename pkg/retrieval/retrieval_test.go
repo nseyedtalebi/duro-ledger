@@ -47,7 +47,7 @@ func TestProjectReplaysTextDocumentsWithCanonicalProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if _, err := raw.Exec(`TRUNCATE events, blobs RESTART IDENTITY`); err != nil {
+	if _, err := raw.Exec(`TRUNCATE events, blobs, blob_locator_observations RESTART IDENTITY`); err != nil {
 		t.Fatal(err)
 	}
 

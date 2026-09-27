@@ -41,10 +41,26 @@ func runCLIErr(t *testing.T, args ...string) ([]byte, error) {
 func TestRootHelpListsCommands(t *testing.T) {
 	for _, args := range [][]string{{"--help"}, {"help"}} {
 		out := string(runCLI(t, args...))
-		for _, want := range []string{"Usage: duro", "init", "append", "file", "sync", "pull", "read", "list", "kg"} {
+		for _, want := range []string{"Usage: duro", "init", "append", "file", "sync", "pull", "read", "list", "kg", "artifact"} {
 			if !strings.Contains(out, want) {
 				t.Fatalf("duro %v output %q missing %q", args, out, want)
 			}
+		}
+	}
+}
+
+func TestArtifactHelpListsSubcommands(t *testing.T) {
+	for _, args := range [][]string{{"artifact", "--help"}, {"artifact", "put", "--help"}, {"artifact", "verify", "--help"}, {"artifact", "locate", "--help"}} {
+		if out := string(runCLI(t, args...)); !strings.Contains(out, "artifact") {
+			t.Fatalf("duro %v output %q missing artifact help", args, out)
+		}
+	}
+}
+
+func TestArtifactCommandsRequireTheirInputsBeforeDatabaseAccess(t *testing.T) {
+	for _, args := range [][]string{{"artifact", "put"}, {"artifact", "verify"}, {"artifact", "locate"}} {
+		if _, err := runCLIErr(t, args...); err == nil {
+			t.Fatalf("duro %v succeeded without required input", args)
 		}
 	}
 }
@@ -415,7 +431,7 @@ func testPostgresDSN(t *testing.T) string {
 		raw.Close()
 		t.Fatalf("postgres.Initialize: %v", err)
 	}
-	if _, err := raw.Exec(`TRUNCATE events, blobs RESTART IDENTITY`); err != nil {
+	if _, err := raw.Exec(`TRUNCATE events, blobs, blob_locator_observations RESTART IDENTITY`); err != nil {
 		_, _ = raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
 		raw.Close()
 		t.Fatalf("truncate: %v", err)
@@ -516,5 +532,54 @@ func TestSyncReportsConflict(t *testing.T) {
 	}
 	if synced.Conflict != 1 {
 		t.Fatalf("want 1 conflict, got %+v", synced)
+	}
+}
+
+func TestArtifactPutLocateVerifyFilesystemCatalog(t *testing.T) {
+	dsn := testPostgresDSN(t)
+	dir := t.TempDir()
+	root := filepath.Join(dir, "blobs")
+
+	firstFile := filepath.Join(dir, "first.bin")
+	if err := os.WriteFile(firstFile, []byte("first artifact"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	firstLocator := "file:///incoming/a%25/run.bin"
+	putOut := runCLI(t, "artifact", "put", "--postgres", dsn, "--blob-root", root, "--file", firstFile, "--locator", firstLocator)
+	var first artifactPutResult
+	if err := json.Unmarshal(putOut, &first); err != nil {
+		t.Fatalf("bad artifact put JSON: %v\n%s", err, putOut)
+	}
+	if !first.Fresh || first.SHA256 == "" || first.Size != int64(len("first artifact")) {
+		t.Fatalf("artifact put = %+v", first)
+	}
+	if _, err := os.Stat(filepath.Join(root, "sha256", first.SHA256[:2], first.SHA256[2:4], first.SHA256)); err != nil {
+		t.Fatalf("artifact CAS file: %v", err)
+	}
+
+	secondFile := filepath.Join(dir, "second.bin")
+	if err := os.WriteFile(secondFile, []byte("second artifact"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runCLI(t, "artifact", "put", "--postgres", dsn, "--blob-root", root, "--file", secondFile, "--locator", "file:///incoming/ax25/run.bin")
+
+	locateOut := runCLI(t, "artifact", "locate", "--postgres", dsn, "--prefix", "file:///incoming/a%25/")
+	var located struct {
+		Locators []postgres.Locator `json:"locators"`
+	}
+	if err := json.Unmarshal(locateOut, &located); err != nil {
+		t.Fatalf("bad artifact locate JSON: %v\n%s", err, locateOut)
+	}
+	if len(located.Locators) != 1 || located.Locators[0].Locator != firstLocator || located.Locators[0].SHA256 != first.SHA256 {
+		t.Fatalf("literal locator prefix result = %+v", located)
+	}
+
+	verifyOut := runCLI(t, "artifact", "verify", "--postgres", dsn, "--blob-root", root, "--sha256", first.SHA256)
+	var verified artifactVerifyResult
+	if err := json.Unmarshal(verifyOut, &verified); err != nil {
+		t.Fatalf("bad artifact verify JSON: %v\n%s", err, verifyOut)
+	}
+	if !verified.Verified || verified.SHA256 != first.SHA256 || verified.Size != first.Size || verified.LastVerifiedAt.IsZero() {
+		t.Fatalf("artifact verify = %+v", verified)
 	}
 }

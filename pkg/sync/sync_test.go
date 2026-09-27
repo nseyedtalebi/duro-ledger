@@ -57,7 +57,7 @@ func openRemote(t *testing.T) *postgres.Store {
 		raw.Close()
 		t.Fatalf("postgres.Initialize: %v", err)
 	}
-	if _, err := raw.Exec(`TRUNCATE events, blobs RESTART IDENTITY`); err != nil {
+	if _, err := raw.Exec(`TRUNCATE events, blobs, blob_locator_observations RESTART IDENTITY`); err != nil {
 		raw.Close()
 		t.Fatalf("truncate events: %v", err)
 	}
@@ -367,7 +367,7 @@ func (verifyingBlobStore) Read(digest string, maxBytes int64) ([]byte, error) {
 	return nil, blob.ErrNotFound
 }
 func (verifyingBlobStore) Verify(digest string, size int64) error { return nil }
-func (verifyingBlobStore) Kind() string                          { return "external-cas" }
+func (verifyingBlobStore) Kind() string                           { return "external-cas" }
 
 func TestPushWithPrestagedExternalBlobLinksWhenBackendVerifies(t *testing.T) {
 	loc := openLocal(t)

@@ -94,10 +94,21 @@ func (e Event) Validate() error {
 		return err
 	}
 	if e.ResourceURI != "" {
-		parsed, err := url.ParseRequestURI(e.ResourceURI)
-		if err != nil || !parsed.IsAbs() || strings.IndexFunc(e.ResourceURI, unicode.IsSpace) >= 0 {
+		if err := ValidateAbsoluteURI(e.ResourceURI); err != nil {
 			return fmt.Errorf("event: resource_uri must be an absolute URI")
 		}
+	}
+	return nil
+}
+
+// ValidateAbsoluteURI is the one absolute-URI rule Duro applies to opaque
+// caller-supplied URIs: parseable, absolute, and free of whitespace. Scheme
+// and path grammar stay the owning project's business. Event resource URIs
+// and artifact physical locators share it so the two can never drift.
+func ValidateAbsoluteURI(uri string) error {
+	parsed, err := url.ParseRequestURI(uri)
+	if err != nil || !parsed.IsAbs() || strings.IndexFunc(uri, unicode.IsSpace) >= 0 {
+		return fmt.Errorf("event: %q is not an absolute URI", uri)
 	}
 	return nil
 }

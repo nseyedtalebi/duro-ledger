@@ -66,7 +66,7 @@ func openAcceptanceStore(t *testing.T) *acceptanceStore {
 
 func (s *acceptanceStore) reset(t *testing.T) {
 	t.Helper()
-	if _, err := s.admin.Exec(`TRUNCATE events, blobs RESTART IDENTITY`); err != nil {
+	if _, err := s.admin.Exec(`TRUNCATE events, blobs, blob_locator_observations RESTART IDENTITY`); err != nil {
 		t.Fatalf("reset canonical store: %v", err)
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -40,10 +41,10 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: duro init|append|file|sync|pull|read|list|kg")
+		return fmt.Errorf("usage: duro init|append|file|sync|pull|read|list|kg|artifact")
 	}
 	if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
-		_, err := fmt.Fprintln(os.Stdout, "Usage: duro init|append|file|sync|pull|read|list|kg")
+		_, err := fmt.Fprintln(os.Stdout, "Usage: duro init|append|file|sync|pull|read|list|kg|artifact")
 		return err
 	}
 	switch args[0] {
@@ -63,6 +64,8 @@ func run(args []string) error {
 		return runList(args[1:])
 	case "kg":
 		return runKG(args[1:])
+	case "artifact":
+		return runArtifact(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -409,6 +412,179 @@ func runList(args []string) error {
 		result.Cursor = doc.Sequence
 	}
 	return json.NewEncoder(os.Stdout).Encode(result)
+}
+
+// runArtifact dispatches the filesystem-CAS artifact catalog subcommands.
+func runArtifact(args []string) error {
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+		_, err := fmt.Fprintln(os.Stdout, "Usage: duro artifact put|verify|locate")
+		return err
+	}
+	switch args[0] {
+	case "put":
+		return runArtifactPut(args[1:])
+	case "verify":
+		return runArtifactVerify(args[1:])
+	case "locate":
+		return runArtifactLocate(args[1:])
+	default:
+		return fmt.Errorf("unknown artifact subcommand %q", args[0])
+	}
+}
+
+// locatorList collects a repeatable --locator flag. stdlib flag has no
+// built-in list type and one observation per invocation would be worse.
+type locatorList []string
+
+func (l *locatorList) String() string     { return strings.Join(*l, ",") }
+func (l *locatorList) Set(v string) error { *l = append(*l, v); return nil }
+
+type artifactPutResult struct {
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size_bytes"`
+	// Fresh reports whether this call created the catalog row. A retry
+	// after a failed catalog write reports fresh again; a retry after a
+	// complete put reports false, having deduplicated the bytes.
+	Fresh    bool     `json:"fresh"`
+	Locators []string `json:"locators,omitempty"`
+}
+
+// runArtifactPut persists bytes in the existing filesystem CAS first, and only
+// then catalogs their canonical metadata and source locator observations. That
+// order is what makes a partial failure retry-safe: the bytes are already
+// deduplicated by digest, so rerunning writes only the missing catalog row.
+func runArtifactPut(args []string) error {
+	fs := flag.NewFlagSet("artifact put", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	dsn := fs.String("postgres", "", "PostgreSQL canonical store DSN")
+	blobRoot := fs.String("blob-root", "", "absolute filesystem blob store root")
+	file := fs.String("file", "", "artifact file to catalog")
+	var locators locatorList
+	fs.Var(&locators, "locator", "absolute source locator URI where these bytes were observed; repeatable")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
+	}
+	if *dsn == "" || *file == "" {
+		return fmt.Errorf("--postgres and --file are required")
+	}
+	if err := blobconfig.Validate(blobconfig.FilesystemKind, *blobRoot); err != nil {
+		return err
+	}
+	for _, locator := range locators {
+		if err := event.ValidateAbsoluteURI(locator); err != nil {
+			return fmt.Errorf("--locator must be an absolute URI: %w", err)
+		}
+	}
+
+	backend, err := blob.NewFilesystemStore(*blobRoot)
+	if err != nil {
+		return err
+	}
+	digest, size, err := backend.PutFile(*file)
+	if err != nil {
+		return err
+	}
+
+	store, err := postgres.Open(*dsn)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	// PutFile streamed these bytes through SHA-256 on the way in, so the
+	// catalog row starts out verified rather than never-checked.
+	fresh, err := store.CatalogArtifact(digest, size, locators, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(artifactPutResult{SHA256: digest, Size: size, Fresh: fresh, Locators: locators})
+}
+
+type artifactVerifyResult struct {
+	SHA256         string    `json:"sha256"`
+	Size           int64     `json:"size_bytes"`
+	Verified       bool      `json:"verified"`
+	LastVerifiedAt time.Time `json:"last_verified_at"`
+}
+
+// runArtifactVerify verifies exactly one cataloged artifact: canonical
+// digest/size metadata first, then the filesystem bytes through the existing
+// CAS check, and only on success is the verification time updated.
+func runArtifactVerify(args []string) error {
+	fs := flag.NewFlagSet("artifact verify", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	dsn := fs.String("postgres", "", "PostgreSQL canonical store DSN")
+	blobRoot := fs.String("blob-root", "", "absolute filesystem blob store root")
+	digest := fs.String("sha256", "", "lowercase hex SHA-256 digest of the artifact to verify")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
+	}
+	if *dsn == "" || *digest == "" {
+		return fmt.Errorf("--postgres and --sha256 are required")
+	}
+	if err := blobconfig.Validate(blobconfig.FilesystemKind, *blobRoot); err != nil {
+		return err
+	}
+
+	store, err := postgres.Open(*dsn)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	meta, ok, err := store.ReadBlobMetadata(*digest)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("artifact %s is not cataloged", *digest)
+	}
+	backend, err := blob.NewFilesystemStore(*blobRoot)
+	if err != nil {
+		return err
+	}
+	if err := backend.Verify(meta.SHA256, meta.Size); err != nil {
+		return err
+	}
+	verifiedAt := time.Now().UTC()
+	if err := store.MarkBlobVerified(meta.SHA256, verifiedAt); err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(artifactVerifyResult{
+		SHA256: meta.SHA256, Size: meta.Size, Verified: true, LastVerifiedAt: verifiedAt,
+	})
+}
+
+func runArtifactLocate(args []string) error {
+	fs := flag.NewFlagSet("artifact locate", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	dsn := fs.String("postgres", "", "PostgreSQL canonical store DSN")
+	prefix := fs.String("prefix", "", "literal locator URI prefix; %, _ and \\ are not wildcards")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
+	}
+	if *dsn == "" {
+		return fmt.Errorf("--postgres is required")
+	}
+	store, err := postgres.Open(*dsn)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	locators, err := store.ListLocators(*prefix)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(struct {
+		Locators []postgres.Locator `json:"locators"`
+	}{Locators: locators})
 }
 
 func runKG(args []string) error {
