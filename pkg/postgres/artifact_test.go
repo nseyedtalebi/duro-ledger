@@ -185,8 +185,8 @@ func TestMarkBlobVerifiedRecordsOneDigest(t *testing.T) {
 func TestListLocatorsPrefixIsLiteral(t *testing.T) {
 	s := openTestStore(t)
 	if _, err := s.CatalogArtifact(artifactDigest, 11, []string{
-		"file:///data/a%b/kept.bin",
-		"file:///data/axb/other.bin",
+		"file:///data/a%25b/kept.bin",
+		"file:///data/ax25b/other.bin",
 		"file:///data/a_c/kept.bin",
 		"file:///data/abc/other.bin",
 	}, time.Time{}); err != nil {
@@ -197,9 +197,9 @@ func TestListLocatorsPrefixIsLiteral(t *testing.T) {
 		prefix string
 		want   []string
 	}{
-		{"file:///data/a%b/", []string{"file:///data/a%b/kept.bin"}},
+		{"file:///data/a%25b/", []string{"file:///data/a%25b/kept.bin"}},
 		{"file:///data/a_c/", []string{"file:///data/a_c/kept.bin"}},
-		{"file:///data/a", []string{"file:///data/a%b/kept.bin", "file:///data/a_c/kept.bin", "file:///data/abc/other.bin", "file:///data/axb/other.bin"}},
+		{"file:///data/a", []string{"file:///data/a%25b/kept.bin", "file:///data/a_c/kept.bin", "file:///data/abc/other.bin", "file:///data/ax25b/other.bin"}},
 	} {
 		got, err := s.ListLocators(tc.prefix)
 		if err != nil {
