@@ -2,3 +2,4 @@
 .env
 .duro-postgres-data/
 .duro-certs/
+**/.DS_Store
