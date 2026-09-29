@@ -1,8 +1,8 @@
 // Command duro is the minimal client for Duro's PostgreSQL event ledger and
-// filesystem artifact store: init provisions the schema, append records a
-// generic event, and artifact put/get store and retrieve content-addressed
-// files. There is no local queue, no sync/pull, and no subcommand
-// framework beyond stdlib flag.
+// filesystem artifact store: init provisions the schema, event put/get
+// append and retrieve events, and artifact put/get store and retrieve
+// content-addressed files. There is no local queue, no sync/pull, and no
+// subcommand framework beyond stdlib flag.
 package main
 
 import (
@@ -27,16 +27,18 @@ var errReported = errors.New("duro: already reported")
 const rootUsage = `Duro: a PostgreSQL event ledger and filesystem artifact store.
 
 Usage:
-  duro init      --postgres DSN [--writer ROLE] [--reader ROLE]
-  duro append    --postgres DSN --type EVENT_TYPE [--content JSON] [--refs JSON]
+  duro init          --postgres DSN [--writer ROLE] [--reader ROLE]
+  duro event put     --postgres DSN --type EVENT_TYPE [--content JSON] [--refs JSON]
+  duro event get     --postgres DSN --id UUID
   duro artifact put  --postgres DSN --root DIR --file PATH
   duro artifact get  --root DIR --sha256 sha256:HEX [--out PATH]
   duro help | --help | -h
 
-Run "duro <command> --help", "duro artifact <subcommand> --help", or
-"duro help <command>" for details on a specific command. See README.md for
-the full contract, output schemas, error schemas, and operator setup (role
-provisioning SQL, compose.yaml, PostgreSQL version requirements).
+Run "duro <command> --help", "duro event <subcommand> --help", "duro
+artifact <subcommand> --help", or "duro help <command>" for details on a
+specific command. See README.md for the full contract, output schemas,
+error schemas, and operator setup (role provisioning SQL, compose.yaml,
+PostgreSQL version requirements).
 
 DSN flags fall back to DURO_POSTGRES_DSN; --root flags fall back to
 DURO_CAS_ROOT.`
@@ -70,8 +72,8 @@ func run(args []string) error {
 		return nil
 	case "init":
 		return runInit(args[1:])
-	case "append":
-		return runAppend(args[1:])
+	case "event":
+		return runEvent(args[1:])
 	case "artifact":
 		return runArtifact(args[1:])
 	default:
@@ -155,9 +157,32 @@ func runInit(args []string) error {
 	return json.NewEncoder(os.Stdout).Encode(map[string]bool{"initialized": true})
 }
 
-// --- append ---
+// --- event ---
 
-const appendUsage = `Usage: duro append --postgres DSN --type EVENT_TYPE [--content JSON] [--refs JSON]
+const eventUsage = `Usage: duro event put|get --help
+
+Subcommands:
+  put   Append one event to the canonical ledger.
+  get   Retrieve one event by id.
+
+Run "duro event put --help" or "duro event get --help" for details.`
+
+func runEvent(args []string) error {
+	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
+		fmt.Println(eventUsage)
+		return nil
+	}
+	switch args[0] {
+	case "put":
+		return runEventPut(args[1:])
+	case "get":
+		return runEventGet(args[1:])
+	default:
+		return fmt.Errorf("unknown event subcommand %q; run \"duro event --help\"", args[0])
+	}
+}
+
+const eventPutUsage = `Usage: duro event put --postgres DSN --type EVENT_TYPE [--content JSON] [--refs JSON]
 
 Appends one event to the canonical ledger in a single database transaction.
 PostgreSQL assigns id (UUIDv7), received_at, and actor (the authenticated
@@ -194,13 +219,13 @@ events for what the caller intended as one call. Only retry if a duplicate
 event is acceptable, or read the ledger first to check.
 
 Example:
-  duro append --postgres "postgres://writer@localhost:5432/duro" \
+  duro event put --postgres "postgres://writer@localhost:5432/duro" \
     --type document.tagged --content '{"tag":"reviewed"}'`
 
-func runAppend(args []string) error {
-	fs := flag.NewFlagSet("append", flag.ContinueOnError)
+func runEventPut(args []string) error {
+	fs := flag.NewFlagSet("event put", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	fs.Usage = func() { fmt.Fprintln(os.Stderr, appendUsage) }
+	fs.Usage = func() { fmt.Fprintln(os.Stderr, eventPutUsage) }
 	dsn := fs.String("postgres", "", "PostgreSQL DSN")
 	eventType := fs.String("type", "", "event type")
 	content := fs.String("content", "", "event content, a JSON object (default {})")
@@ -210,12 +235,12 @@ func runAppend(args []string) error {
 	}
 	if fs.NArg() > 0 {
 		fs.Usage()
-		return fmt.Errorf("append: unexpected argument(s): %v", fs.Args())
+		return fmt.Errorf("event put: unexpected argument(s): %v", fs.Args())
 	}
 	resolvedDSN := postgresDSN(*dsn)
 	if resolvedDSN == "" || *eventType == "" {
 		fs.Usage()
-		return fmt.Errorf("append: --postgres (or DURO_POSTGRES_DSN) and --type are required")
+		return fmt.Errorf("event put: --postgres (or DURO_POSTGRES_DSN) and --type are required")
 	}
 
 	var contentSet, refsSet bool
@@ -250,6 +275,68 @@ func runAppend(args []string) error {
 	return json.NewEncoder(os.Stdout).Encode(toEventJSON(se))
 }
 
+const eventGetUsage = `Usage: duro event get --postgres DSN --id UUID
+
+Retrieves one event by id, exactly as PostgreSQL stored it. This command
+never writes to the ledger.
+
+Flags:
+  --postgres DSN   PostgreSQL DSN (required). Falls back to
+                    DURO_POSTGRES_DSN. A reader-role DSN is sufficient.
+  --id UUID        Required. The event's id: a canonical hyphenated
+                    UUIDv7 (RFC 9562 variant). Malformed ids, other UUID
+                    versions, and other variants are rejected before any
+                    database connection is opened.
+
+Output (stdout, on success): the complete stored event as JSON:
+  {"id":"...","received_at":"...","event_type":"...","actor":"...",
+   "content":{...},"refs":{...}}
+
+Errors (stderr, exit code 1): a malformed --id is reported as a plain
+message before any database connection is opened. No event with that id is
+a distinct plain "not found" message. Other database/connection failures
+are reported as plain messages.
+
+Example:
+  duro event get --postgres "postgres://reader@localhost:5432/duro" \
+    --id 01926a3e-1c2d-7000-8abc-0123456789ab`
+
+func runEventGet(args []string) error {
+	fs := flag.NewFlagSet("event get", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.Usage = func() { fmt.Fprintln(os.Stderr, eventGetUsage) }
+	dsn := fs.String("postgres", "", "PostgreSQL DSN")
+	id := fs.String("id", "", "event id, a canonical UUIDv7")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		fs.Usage()
+		return fmt.Errorf("event get: unexpected argument(s): %v", fs.Args())
+	}
+	resolvedDSN := postgresDSN(*dsn)
+	if resolvedDSN == "" || *id == "" {
+		fs.Usage()
+		return fmt.Errorf("event get: --postgres (or DURO_POSTGRES_DSN) and --id are required")
+	}
+	if !event.ValidID(*id) {
+		fs.Usage()
+		return fmt.Errorf("event get: --id %q is not a canonical UUIDv7", *id)
+	}
+
+	store, err := postgres.Open(resolvedDSN)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	se, err := store.Get(*id)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(toEventJSON(se))
+}
+
 // rawJSONFlag returns val as the raw JSON a caller supplied for a --content
 // or --refs flag, or nil if the flag was never set on the command line.
 // event.New defaults a nil field to {}; an explicitly empty string ("--content
@@ -262,8 +349,8 @@ func rawJSONFlag(val string, set bool) json.RawMessage {
 	return json.RawMessage(val)
 }
 
-// eventJSON is the wire shape of a stored event, shared by "append" and
-// "artifact put" so the encoding lives in one place.
+// eventJSON is the wire shape of a stored event, shared by "event put",
+// "event get", and "artifact put" so the encoding lives in one place.
 type eventJSON struct {
 	ID         string          `json:"id"`
 	ReceivedAt string          `json:"received_at"`

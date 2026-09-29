@@ -84,6 +84,43 @@ func (n New) RefsOrDefault() json.RawMessage {
 	return n.Refs
 }
 
+// ValidID reports whether id is a canonical hyphenated UUIDv7: 8-4-4-4-12
+// hex groups (case-insensitive), version nibble 7, and the RFC 9562 variant
+// (the high bits of the first nibble after the third hyphen are 10). This is
+// the sole validation of a caller-supplied event id, shared by the CLI and
+// pkg/postgres, so an id is rejected -- including any SQL-injection payload,
+// which cannot match this shape -- before it ever reaches a query.
+func ValidID(id string) bool {
+	if len(id) != 36 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		switch i {
+		case 8, 13, 18, 23:
+			if id[i] != '-' {
+				return false
+			}
+		default:
+			if !isHex(id[i]) {
+				return false
+			}
+		}
+	}
+	if id[14] != '7' {
+		return false
+	}
+	switch id[19] {
+	case '8', '9', 'a', 'A', 'b', 'B':
+	default:
+		return false
+	}
+	return true
+}
+
+func isHex(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
 // validateObject requires b to be nil (caller omitted it; the caller will
 // default it) or to decode as a JSON object. An explicit JSON null, a
 // non-nil empty value, a scalar, or an array is rejected.

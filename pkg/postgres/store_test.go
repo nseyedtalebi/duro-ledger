@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -138,6 +139,40 @@ func TestAppendRoundTrip(t *testing.T) {
 	var ae *AppendError
 	if _, err := s.Append(event.New{EventType: "a", Content: json.RawMessage(`[]`)}); err == nil || errors.As(err, &ae) {
 		t.Errorf("Append with non-object content = %v, want a plain validation error", err)
+	}
+}
+
+func TestGet(t *testing.T) {
+	dsn := initializedDB(t)
+	admin := openStore(t, dsn)
+	want, err := admin.Append(event.New{EventType: "readback", Content: json.RawMessage(`{"n":1}`), Refs: json.RawMessage(`{"source":"test"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	role, readerDSN := pgtest.NewRole(t, dsn)
+	if err := ProvisionReader(dsn, role); err != nil {
+		t.Fatal(err)
+	}
+	reader := openStore(t, readerDSN)
+	for _, id := range []string{want.ID, strings.ToUpper(want.ID)} {
+		got, err := reader.Get(id)
+		if err != nil || !reflect.DeepEqual(got, want) {
+			t.Fatalf("Get(%q) = %+v, %v; want %+v", id, got, err, want)
+		}
+	}
+	if _, err := reader.Get("00000000-0000-7000-8000-000000000000"); !errors.Is(err, ErrEventNotFound) {
+		t.Fatalf("missing event error = %v", err)
+	}
+	if _, err := (&Store{}).Get("bad"); err == nil || errors.Is(err, ErrEventNotFound) {
+		t.Fatalf("invalid id must fail before database access: %v", err)
+	}
+	var count int
+	if err := admin.db.QueryRow(`SELECT count(*) FROM public.events`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("Get changed ledger: count=%d, err=%v", count, err)
+	}
+	reader.Close()
+	if _, err := reader.Get(want.ID); err == nil || errors.Is(err, ErrEventNotFound) {
+		t.Fatalf("closed database should return a database error, got %v", err)
 	}
 }
 

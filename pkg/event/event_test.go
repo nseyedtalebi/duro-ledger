@@ -52,6 +52,26 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestValidID(t *testing.T) {
+	const id = "01923456-789a-7bcd-8123-456789abcdef"
+	for _, variant := range "89aAbB" {
+		valid := id[:19] + string(variant) + id[20:]
+		if !ValidID(valid) || !ValidID(strings.ToUpper(valid)) {
+			t.Errorf("rejected UUIDv7 %q", valid)
+		}
+	}
+	for _, invalid := range []string{
+		"", "bad", id + "\n", " " + id, strings.ReplaceAll(id, "-", ""),
+		id[:14] + "4" + id[15:], id[:19] + "0" + id[20:],
+		id[:19] + "c" + id[20:], id[:35] + "g", id[:8] + "_" + id[9:],
+		"'; DROP TABLE events; --",
+	} {
+		if ValidID(invalid) {
+			t.Errorf("accepted invalid UUIDv7 %q", invalid)
+		}
+	}
+}
+
 func TestDefaultsOnlyForNil(t *testing.T) {
 	n := New{EventType: "a"}
 	if got := string(n.ContentOrDefault()); got != "{}" {

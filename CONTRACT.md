@@ -6,7 +6,8 @@
 
 Duro provides:
 
-- Append an event to PostgreSQL.
+- Append an event to PostgreSQL (`event put`).
+- Retrieve an event by its UUIDv7 (`event get`).
 - Store an artifact on the filesystem.
 - Retrieve an artifact by its digest.
 
@@ -35,6 +36,14 @@ PostgreSQL `jsonb` normalizes formatting and retains the last value of duplicate
 - Repeating the same input creates another event.
 - Validation or confirmed transaction failure returns an error.
 - A lost connection with an uncertain commit outcome returns **outcome unknown**. No automatic resubmission.
+
+### Get
+
+- Input: an event ID, as a hyphenated UUIDv7 (case-insensitive hexadecimal, RFC variant).
+- Reject malformed IDs, other UUID versions, and other variants before database access.
+- Return the complete stored event; the CLI emits one newline-terminated JSON object.
+- A missing event returns a distinct not-found error. Database or permission failures return errors, not empty records.
+- Retrieval is read-only and requires only reader privileges. CLI failures produce stderr diagnostics and a nonzero exit.
 
 ### Identity and reading
 
@@ -120,6 +129,7 @@ The events provide the artifact observation history.
 Required verification:
 
 - Real PostgreSQL append, committed readback, and duplicate-input/new-event behavior.
+- Event lookup by ID through the library and CLI: full-record equality, restricted-reader access, invalid IDs, missing records, and database failures.
 - Database-generated IDs verified as UUIDv7; caller identity overrides rejected.
 - Restricted-role tests for validation, actor binding, and forbidden mutations.
 - Concurrent full-read tests consistent with the documented ordering/snapshot semantics.
@@ -129,5 +139,3 @@ Required verification:
 - Corruption, disk/write failure, interruption, and partial-output tests.
 - Memory measurements across increasing artifact sizes at fixed concurrency.
 - CLI and library paths both exercised; skipped integration tests do not count as passes.
-
-

@@ -489,6 +489,37 @@ func (s *Store) Append(n event.New) (StoredEvent, error) {
 	return se, nil
 }
 
+// ErrEventNotFound is returned by Get when no event exists with the
+// requested id.
+var ErrEventNotFound = errors.New("postgres: event not found")
+
+// Get retrieves one event by id, exactly as PostgreSQL stored it: a single
+// schema-qualified, parameterized SELECT of all six columns from
+// public.events. It never writes. id must be a canonical hyphenated UUIDv7
+// (see event.ValidID, the same validation the CLI applies before opening a
+// connection); Get validates it again itself so a malformed or malicious id
+// never reaches the database regardless of caller.
+func (s *Store) Get(id string) (StoredEvent, error) {
+	if !event.ValidID(id) {
+		return StoredEvent{}, fmt.Errorf("postgres: %q is not a canonical UUIDv7 event id", id)
+	}
+	var se StoredEvent
+	var content, refs []byte
+	err := s.db.QueryRow(
+		`SELECT id, received_at, event_type, actor, content, refs FROM public.events WHERE id = $1`,
+		id,
+	).Scan(&se.ID, &se.ReceivedAt, &se.EventType, &se.Actor, &content, &refs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return StoredEvent{}, ErrEventNotFound
+	}
+	if err != nil {
+		return StoredEvent{}, err
+	}
+	se.Content = json.RawMessage(content)
+	se.Refs = json.RawMessage(refs)
+	return se, nil
+}
+
 // classifyCommitErr distinguishes a server-confirmed non-commit from an
 // outcome Duro cannot confirm. pgx.ErrTxCommitRollback means the server
 // answered that the commit rolled back, and sql.ErrTxDone means database/sql

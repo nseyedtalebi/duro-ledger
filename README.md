@@ -6,7 +6,8 @@
 
 Duro provides:
 
-- Append an event to PostgreSQL.
+- Append an event to PostgreSQL (`event put`).
+- Retrieve an event by its UUIDv7 (`event get`).
 - Store an artifact on the filesystem.
 - Retrieve an artifact by its digest.
 
@@ -35,6 +36,14 @@ PostgreSQL `jsonb` normalizes formatting and retains the last value of duplicate
 - Repeating the same input creates another event.
 - Validation or confirmed transaction failure returns an error.
 - A lost connection with an uncertain commit outcome returns **outcome unknown**. No automatic resubmission.
+
+### Get
+
+- Input: an event ID, as a hyphenated UUIDv7 (case-insensitive hexadecimal, RFC variant).
+- Reject malformed IDs, other UUID versions, and other variants before database access.
+- Return the complete stored event; the CLI emits one newline-terminated JSON object.
+- A missing event returns a distinct not-found error. Database or permission failures return errors, not empty records.
+- Retrieval is read-only and requires only reader privileges. CLI failures produce stderr diagnostics and a nonzero exit.
 
 ### Identity and reading
 
@@ -120,6 +129,7 @@ The events provide the artifact observation history.
 Required verification:
 
 - Real PostgreSQL append, committed readback, and duplicate-input/new-event behavior.
+- Event lookup by ID through the library and CLI: full-record equality, restricted-reader access, invalid IDs, missing records, and database failures.
 - Database-generated IDs verified as UUIDv7; caller identity overrides rejected.
 - Restricted-role tests for validation, actor binding, and forbidden mutations.
 - Concurrent full-read tests consistent with the documented ordering/snapshot semantics.
@@ -189,7 +199,7 @@ duro init --postgres "$ADMIN_DSN" --writer duro_writer --reader duro_reader
 # 4. Append an event and store an artifact, as the writer.
 export DURO_POSTGRES_DSN="postgres://duro_writer:w...@127.0.0.1:5433/duro"
 export DURO_CAS_ROOT=/var/lib/duro/artifacts
-duro append --type document.tagged --content '{"tag":"reviewed"}'
+duro event put --type document.tagged --content '{"tag":"reviewed"}'
 duro artifact put --file ./report.pdf
 duro artifact get --sha256 sha256:<64 hex> --out ./restored.pdf
 ```
@@ -225,8 +235,9 @@ config file and no other implicit source. A DSN is whatever `pgx` accepts
 ## `duro`
 
 ```
-duro init      --postgres DSN [--writer ROLE] [--reader ROLE]
-duro append    --postgres DSN --type EVENT_TYPE [--content JSON] [--refs JSON]
+duro init          --postgres DSN [--writer ROLE] [--reader ROLE]
+duro event put     --postgres DSN --type EVENT_TYPE [--content JSON] [--refs JSON]
+duro event get     --postgres DSN --id UUID
 duro artifact put  --postgres DSN --root DIR --file PATH
 duro artifact get  --root DIR --sha256 sha256:HEX [--out PATH]
 duro help | --help | -h
@@ -295,11 +306,21 @@ duro init --postgres "postgres://admin@localhost:5432/duro" \
   --writer duro_writer --reader duro_reader
 ```
 
-## `duro append`
+## `duro event`
+
+A group with `put` and `get` subcommands. `duro event`, `duro event --help`,
+and `duro event -h` print group help and exit 0. Use
+`duro event put --help` / `duro event get --help`, or
+`duro help event put` / `duro help event get`, for command-specific help.
+An unknown subcommand is an error. No help command opens a database.
+
+## `duro event put`
 
 Appends one event in one direct transaction and prints the committed row.
 PostgreSQL assigns `id`, `received_at`, and `actor`; this command cannot
 override them (with writer credentials it has no privilege to try).
+Despite its name, `put` never upserts or replaces: each successful invocation
+appends a new event with a fresh database-generated ID.
 
 | Argument | Required | Default | Notes |
 |---|---|---|---|
@@ -329,6 +350,45 @@ and compact input that is still over 1 MiB after normalization is rejected.
 - **No automatic retry, ever.** Repeating the command creates another event.
   After an `unknown` outcome, retrying can leave two events for what you
   meant as one append; read the ledger first if that matters.
+
+## `duro event get`
+
+Retrieves one event by its UUIDv7 primary key, without modifying the ledger.
+
+| Argument | Required | Default | Notes |
+|---|---|---|---|
+| `--postgres DSN` | yes | `DURO_POSTGRES_DSN` | A reader-role DSN is enough. A nonempty flag overrides the environment. |
+| `--id UUID` | yes | -- | Hyphenated UUIDv7 with the RFC variant; hexadecimal is case-insensitive. No positional ID argument. |
+
+- **stdout on success:** one newline-terminated JSON object, with the same
+  six fields as `event put`: `id`, `received_at`, `event_type`, `actor`,
+  `content`, and `refs`. It returns the stored values, including the original
+  writer's actor, not the reader's identity. No format flag is needed.
+- **stderr, exit 1:** malformed IDs (including other UUID versions/variants)
+  are rejected before opening a connection; missing events report
+  `postgres: event not found`. Connection, permission, and other database
+  failures are errors, not missing records. These failures leave stdout empty.
+- **Side effects:** none. The library uses a single parameterized SELECT
+  against `public.events`; no initialization or schema changes occur.
+
+```sh
+duro event get --postgres "$READER_DSN" \
+  --id 01926a3e-1c2d-7000-8abc-0123456789ab
+```
+
+Compose a write with a read using `jq` (an optional pipeline tool, not a Duro
+dependency). In Bash, `pipefail` preserves failures upstream:
+
+```bash
+set -euo pipefail
+id=$(duro event put --postgres "$WRITER_DSN" --type document.tagged \
+  --content '{"tag":"reviewed"}' | jq -er '.id')
+duro event get --postgres "$READER_DSN" --id "$id"
+```
+
+Use DSNs for the same database. Do not automatically repeat `event put` if
+the pipeline fails: the event may already have committed. A known ID lets
+you repeat the read without creating another event.
 
 ## `duro artifact`
 
@@ -629,8 +689,13 @@ replacement: the local SQLite queue and offline append path, `sync`/pull
 between stores, the MCP server (`cmd/duro-mcp`), the knowledge graph,
 retrieval/projection packages, the pluggable blob-store configuration and
 PostgreSQL blob backend, and the artifact catalog/locator commands. The
-remaining surface is exactly `init`, `append`, `artifact put`,
+remaining surface is exactly `init`, `event put`, `event get`, `artifact put`,
 `artifact get`, and the four packages above.
+
+The former root `duro append` command is now `duro event put`; there is no
+compatibility alias. Update scripts accordingly. The underlying append
+semantics and Go `Store.Append` API are unchanged; `Store.Get(id)` adds a
+read-only lookup and returns `postgres.ErrEventNotFound` for absent events.
 
 The event table is also different from earlier Duro schemas (database-owned
 `id`/`received_at`/`actor`, `jsonb` `content`/`refs` with server-side
@@ -659,7 +724,8 @@ shared `public.events`.
 If the variable is unset the tests **fail** rather than skip: the contract's
 acceptance gate does not count a skipped integration test as a pass.
 
-Covered: committed append and readback, duplicate-input events, UUIDv7
+Covered: committed append and readback, event get full-record equality and
+restricted-reader access, invalid/missing IDs and database errors, duplicate-input events, UUIDv7
 version/variant bits, `received_at` as insertion time, `actor` bound to
 `session_user` (including under `SET ROLE`), every field constraint at the
 database boundary, oversized-versus-normalized JSON, incompatible-schema
@@ -681,7 +747,7 @@ exact observation-event
 readback, stored-artifact-with-failed-append reporting, allocation per
 operation across a 16x artifact-size range at fixed concurrency, and the
 real compiled CLI for every help surface, argument rejection,
-environment/flag precedence, end-to-end init/append/put/get, and the
+environment/flag precedence, end-to-end init/event put/event get/artifact put/artifact get, and the
 partial-outcome JSON error schema.
 
 One case is not covered by these tests: a connection lost *after* `COMMIT`

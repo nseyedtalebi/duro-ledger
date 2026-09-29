@@ -72,13 +72,18 @@ func TestHelpExitsZeroWithoutIO(t *testing.T) {
 		{"--help"},
 		{"-h"},
 		{"init", "--help"},
-		{"append", "--help"},
+		{"event"},
+		{"event", "--help"},
+		{"event", "put", "--help"},
+		{"event", "get", "--help"},
 		{"artifact"},
 		{"artifact", "--help"},
 		{"artifact", "put", "--help"},
 		{"artifact", "get", "--help"},
 		{"help", "init"},
-		{"help", "append"},
+		{"help", "event"},
+		{"help", "event", "put"},
+		{"help", "event", "get"},
 		{"help", "artifact"},
 		{"help", "artifact", "put"},
 		{"help", "artifact", "get"},
@@ -101,25 +106,34 @@ func TestHelpExitsZeroWithoutIO(t *testing.T) {
 
 func TestBadArgumentsRejected(t *testing.T) {
 	cases := map[string][]string{
-		"unknown command":             {"frobnicate"},
-		"unknown artifact subcommand": {"artifact", "frobnicate"},
-		"init positional":             {"init", "--postgres", "postgres://x/y", "extra"},
-		"append positional":           {"append", "--postgres", "postgres://x/y", "--type", "t", "extra"},
-		"put positional":              {"artifact", "put", "--postgres", "postgres://x/y", "--root", "/nonexistent/duro-store", "--file", "f", "extra"},
-		"get positional":              {"artifact", "get", "--root", "/nonexistent/duro-store", "--sha256", "sha256:" + strings.Repeat("ab", 32), "extra"},
-		"init missing dsn":            {"init"},
-		"append missing dsn":          {"append", "--type", "t"},
-		"append missing type":         {"append", "--postgres", "postgres://x/y"},
-		"append blank type":           {"append", "--postgres", "postgres://x/y", "--type", "  \t "},
-		"append explicit empty json":  {"append", "--postgres", "postgres://x/y", "--type", "t", "--content", ""},
-		"append null content":         {"append", "--postgres", "postgres://x/y", "--type", "t", "--content", "null"},
-		"append array refs":           {"append", "--postgres", "postgres://x/y", "--type", "t", "--refs", "[]"},
-		"append unknown flag":         {"append", "--nope"},
-		"put missing file":            {"artifact", "put", "--postgres", "postgres://x/y", "--root", "/nonexistent/duro-store"},
-		"put missing root":            {"artifact", "put", "--postgres", "postgres://x/y", "--file", "f"},
-		"get missing digest":          {"artifact", "get", "--root", "/nonexistent/duro-store"},
-		"get malformed digest":        {"artifact", "get", "--root", "/nonexistent/duro-store", "--sha256", "deadbeef"},
-		"get bare hex digest":         {"artifact", "get", "--root", "/nonexistent/duro-store", "--sha256", strings.Repeat("ab", 32)},
+		"unknown command":               {"frobnicate"},
+		"retired append":                {"append", "--type", "t"},
+		"unknown event subcommand":      {"event", "frobnicate"},
+		"unknown artifact subcommand":   {"artifact", "frobnicate"},
+		"init positional":               {"init", "--postgres", "postgres://x/y", "extra"},
+		"event put positional":          {"event", "put", "--postgres", "postgres://x/y", "--type", "t", "extra"},
+		"event get positional":          {"event", "get", "--postgres", "postgres://x/y", "--id", "01923456-789a-7bcd-8123-456789abcdef", "extra"},
+		"put positional":                {"artifact", "put", "--postgres", "postgres://x/y", "--root", "/nonexistent/duro-store", "--file", "f", "extra"},
+		"get positional":                {"artifact", "get", "--root", "/nonexistent/duro-store", "--sha256", "sha256:" + strings.Repeat("ab", 32), "extra"},
+		"init missing dsn":              {"init"},
+		"event put missing dsn":         {"event", "put", "--type", "t"},
+		"event put missing type":        {"event", "put", "--postgres", "postgres://x/y"},
+		"event put blank type":          {"event", "put", "--postgres", "postgres://x/y", "--type", "  \t "},
+		"event put explicit empty json": {"event", "put", "--postgres", "postgres://x/y", "--type", "t", "--content", ""},
+		"event put null content":        {"event", "put", "--postgres", "postgres://x/y", "--type", "t", "--content", "null"},
+		"event put array refs":          {"event", "put", "--postgres", "postgres://x/y", "--type", "t", "--refs", "[]"},
+		"event put unknown flag":        {"event", "put", "--nope"},
+		"event get missing dsn":         {"event", "get", "--id", "01923456-789a-7bcd-8123-456789abcdef"},
+		"event get missing id":          {"event", "get", "--postgres", "postgres://x/y"},
+		"event get malformed id":        {"event", "get", "--postgres", "postgres://x/y", "--id", "not-a-uuid"},
+		"event get wrong version id":    {"event", "get", "--postgres", "postgres://x/y", "--id", "01923456-789a-4bcd-8123-456789abcdef"},
+		"event get wrong variant id":    {"event", "get", "--postgres", "postgres://x/y", "--id", "01923456-789a-7bcd-0123-456789abcdef"},
+		"event get injection id":        {"event", "get", "--postgres", "postgres://x/y", "--id", "'; DROP TABLE events; --"},
+		"put missing file":              {"artifact", "put", "--postgres", "postgres://x/y", "--root", "/nonexistent/duro-store"},
+		"put missing root":              {"artifact", "put", "--postgres", "postgres://x/y", "--file", "f"},
+		"get missing digest":            {"artifact", "get", "--root", "/nonexistent/duro-store"},
+		"get malformed digest":          {"artifact", "get", "--root", "/nonexistent/duro-store", "--sha256", "deadbeef"},
+		"get bare hex digest":           {"artifact", "get", "--root", "/nonexistent/duro-store", "--sha256", strings.Repeat("ab", 32)},
 	}
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -173,7 +187,7 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("second init: exit %d, stderr %s", got.code, got.stderr)
 	}
 
-	got := duro(t, nil, "append", "--postgres", dsn, "--type", "document.tagged", "--content", `{"tag":"reviewed"}`)
+	got := duro(t, nil, "event", "put", "--postgres", dsn, "--type", "document.tagged", "--content", `{"tag":"reviewed"}`)
 	if got.code != 0 {
 		t.Fatalf("append: exit %d, stderr %s", got.code, got.stderr)
 	}
@@ -188,7 +202,7 @@ func TestEndToEnd(t *testing.T) {
 		t.Errorf("refs = %s, want {}", first.Refs)
 	}
 	// Repeating the same input creates a distinct event.
-	repeat := duro(t, nil, "append", "--postgres", dsn, "--type", "document.tagged", "--content", `{"tag":"reviewed"}`)
+	repeat := duro(t, nil, "event", "put", "--postgres", dsn, "--type", "document.tagged", "--content", `{"tag":"reviewed"}`)
 	var second eventJSON
 	if err := json.Unmarshal([]byte(repeat.stdout), &second); err != nil {
 		t.Fatalf("repeat append stdout %q: %v", repeat.stdout, err)
@@ -286,7 +300,7 @@ func TestEnvFallbackAndFlagPrecedence(t *testing.T) {
 	}
 	env := []string{"DURO_POSTGRES_DSN=" + dsn, "DURO_CAS_ROOT=" + root}
 
-	if got := duro(t, env, "append", "--type", "env.fallback"); got.code != 0 {
+	if got := duro(t, env, "event", "put", "--type", "env.fallback"); got.code != 0 {
 		t.Errorf("append via env fallback: exit %d, stderr %s", got.code, got.stderr)
 	}
 	if got := duro(t, env, "artifact", "put", "--file", src); got.code != 0 {
@@ -296,10 +310,10 @@ func TestEnvFallbackAndFlagPrecedence(t *testing.T) {
 	// Flags win over the environment: a broken env plus a good flag works,
 	// and a good env plus a broken flag fails.
 	broken := []string{"DURO_POSTGRES_DSN=postgres://nobody@127.0.0.1:1/none?sslmode=disable&connect_timeout=2", "DURO_CAS_ROOT=/nonexistent/duro-root"}
-	if got := duro(t, broken, "append", "--postgres", dsn, "--type", "flag.wins"); got.code != 0 {
+	if got := duro(t, broken, "event", "put", "--postgres", dsn, "--type", "flag.wins"); got.code != 0 {
 		t.Errorf("flag should override a broken env DSN: exit %d, stderr %s", got.code, got.stderr)
 	}
-	if got := duro(t, env, "append", "--postgres", "postgres://nobody@127.0.0.1:1/none?sslmode=disable&connect_timeout=2", "--type", "flag.wins"); got.code == 0 {
+	if got := duro(t, env, "event", "put", "--postgres", "postgres://nobody@127.0.0.1:1/none?sslmode=disable&connect_timeout=2", "--type", "flag.wins"); got.code == 0 {
 		t.Error("a broken --postgres flag should not fall back to the environment")
 	}
 	if got := duro(t, broken, "artifact", "get", "--root", root, "--sha256", "sha256:"+strings.Repeat("ab", 32)); got.code == 0 {
@@ -373,7 +387,7 @@ func TestInitProvisionsRoles(t *testing.T) {
 	if got := duro(t, nil, "init", "--postgres", adminDSN, "--writer", writer, "--reader", reader); got.code != 0 {
 		t.Fatalf("init with roles: exit %d, stderr %s", got.code, got.stderr)
 	}
-	appended := duro(t, nil, "append", "--postgres", writerDSN, "--type", "writer.cli.append")
+	appended := duro(t, nil, "event", "put", "--postgres", writerDSN, "--type", "writer.cli.append", "--content", `{"n":1}`, "--refs", `{"source":"test"}`)
 	if appended.code != 0 {
 		t.Fatalf("writer append: exit %d, stderr %s", appended.code, appended.stderr)
 	}
@@ -384,7 +398,11 @@ func TestInitProvisionsRoles(t *testing.T) {
 	if se.Actor != writer {
 		t.Errorf("actor = %q, want %q", se.Actor, writer)
 	}
-	if got := duro(t, nil, "append", "--postgres", readerDSN, "--type", "reader.cli.append"); got.code == 0 {
+	read := duro(t, nil, "event", "get", "--postgres", readerDSN, "--id", se.ID)
+	if read.code != 0 || read.stderr != "" || read.stdout != appended.stdout || !strings.HasSuffix(read.stdout, "\n") {
+		t.Fatalf("reader get did not return complete put JSON: %+v, want %q", read, appended.stdout)
+	}
+	if got := duro(t, nil, "event", "put", "--postgres", readerDSN, "--type", "reader.cli.append"); got.code == 0 {
 		t.Error("reader was allowed to append through the CLI")
 	}
 	// The administrator/owner role cannot be provisioned as a writer.
@@ -399,5 +417,41 @@ func TestInitProvisionsRoles(t *testing.T) {
 	}
 	if got := duro(t, nil, "init", "--postgres", adminDSN, "--writer", owner); got.code == 0 {
 		t.Error("init provisioned the owner role as a writer")
+	}
+}
+
+func TestEventGetErrorsAndDSN(t *testing.T) {
+	dsn := initializedDB(t)
+	put := duro(t, nil, "event", "put", "--postgres", dsn, "--type", "get.test")
+	var se eventJSON
+	if err := json.Unmarshal([]byte(put.stdout), &se); err != nil || put.code != 0 {
+		t.Fatalf("put: %+v, %v", put, err)
+	}
+	const broken = "postgres://nobody@127.0.0.1:1/none?sslmode=disable&connect_timeout=1"
+	env := []string{"DURO_POSTGRES_DSN=" + dsn}
+	for _, args := range [][]string{
+		{"event", "get", "--id", se.ID},
+		{"event", "get", "--id", se.ID, "--postgres", ""},
+	} {
+		got := duro(t, env, args...)
+		if got.code != 0 || got.stderr != "" || got.stdout != put.stdout {
+			t.Fatalf("env fallback: %+v", got)
+		}
+	}
+	got := duro(t, []string{"DURO_POSTGRES_DSN=" + broken}, "event", "get", "--id", se.ID, "--postgres", dsn)
+	if got.code != 0 || got.stdout != put.stdout {
+		t.Fatalf("flag should override broken env: %+v", got)
+	}
+	_, deniedDSN := pgtest.NewRole(t, dsn)
+	for _, tc := range []struct{ id, dsn, message string }{
+		{"00000000-0000-7000-8000-000000000000", dsn, "not found"},
+		{"bad", broken, "not a canonical UUIDv7"},
+		{se.ID, broken, "connect"},
+		{se.ID, deniedDSN, "permission denied"},
+	} {
+		got := duro(t, env, "event", "get", "--id", tc.id, "--postgres", tc.dsn)
+		if got.code == 0 || got.stdout != "" || !strings.Contains(got.stderr, tc.message) {
+			t.Errorf("get %q: %+v, want error containing %q", tc.id, got, tc.message)
+		}
 	}
 }
