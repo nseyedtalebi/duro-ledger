@@ -492,9 +492,41 @@ duro artifact get --root /var/lib/duro/artifacts \
 
 # Library usage
 
-Four small packages: `pkg/event` (input shape and client-side validation),
-`pkg/postgres` (the canonical ledger), `pkg/cas` (the content-addressed
-store), `pkg/artifact` (the two-store put/get orchestration).
+The Go library has four small packages: `pkg/event` (input shape and
+client-side validation), `pkg/postgres` (the canonical ledger), `pkg/cas`
+(the content-addressed store), and `pkg/artifact` (the two-store put/get
+orchestration). The `duro` Python package is a small event writer for ETLs and
+other orchestration; artifacts remain CLI/Go-library operations.
+
+## Python event writer
+
+Install this repository as a Python package, then append a JSON-object event
+without writing SQL or managing a PostgreSQL transaction:
+
+```python
+from duro import AppendError, append_event
+
+try:
+    receipt = append_event(
+        "rador.etl.completed",
+        content={"run_id": "run-1"},
+        refs={"source": "rador"},
+        # dsn defaults to DURO_POSTGRES_DSN.
+    )
+except AppendError as error:
+    if error.outcome == "unknown":
+        # Commit confirmation was lost: the event may exist. Never retry
+        # automatically; read the ledger first if duplication matters.
+        raise
+    raise
+
+print(receipt.id, receipt.actor, receipt.received_at)
+```
+
+`content` and `refs` must be JSON objects and default to `{}`. PostgreSQL
+assigns `id`, `received_at`, and `actor`; each successful call appends a new
+event. `AppendError.outcome` is `not_committed` for a definite failure or
+`unknown` when the commit result cannot be confirmed. The client never retries.
 
 ```go
 // Administrator/provisioning path, once per deployment.
@@ -713,6 +745,7 @@ this package.
 ```sh
 export DURO_POSTGRES_TEST_DSN="postgresql://postgres@127.0.0.1:5433/postgres?sslmode=disable"
 go test -race ./...
+uv run python -m unittest discover -s python/tests -v
 ```
 
 `DURO_POSTGRES_TEST_DSN` must be an administrator DSN for a **disposable**

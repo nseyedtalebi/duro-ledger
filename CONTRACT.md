@@ -8,6 +8,7 @@ Duro provides:
 
 - Append an event to PostgreSQL (`event put`).
 - Retrieve an event by its UUIDv7 (`event get`).
+- Append an event from Python (`duro.append_event`).
 - Store an artifact on the filesystem.
 - Retrieve an artifact by its digest.
 
@@ -138,4 +139,4 @@ Required verification:
 - Stored-artifact/event-append failure and unknown-commit cases, including accurate partial-outcome reporting and retention of stored artifacts.
 - Corruption, disk/write failure, interruption, and partial-output tests.
 - Memory measurements across increasing artifact sizes at fixed concurrency.
-- CLI and library paths both exercised; skipped integration tests do not count as passes.
+- CLI, Go-library, and Python-client paths all exercised; skipped integration tests do not count as passes.

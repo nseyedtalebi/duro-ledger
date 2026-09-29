@@ -4,3 +4,8 @@
 .duro-postgres18-data/
 .duro-certs/
 **/.DS_Store
+.venv/
+__pycache__/
+*.egg-info/
+build/
+dist/

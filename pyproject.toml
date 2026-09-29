@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "duro-ledger"
+version = "0.1.0"
+description = "Python client for the Duro PostgreSQL event ledger"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "psycopg[binary]>=3.2,<4",
+]
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["duro*"]
