@@ -181,23 +181,34 @@ go build ./cmd/duro
 
 ## Quick start
 
+The script starts the PostgreSQL 18 Compose service, waits for its health check,
+then initializes the schema. Build/install `duro` first and set the Compose
+password and administrator DSN:
+
 ```sh
-# 1. A PostgreSQL 18 server (see compose.yaml for a local one).
-export DURO_POSTGRES_PASSWORD=...           # required by compose.yaml
-docker compose up -d postgres18
+export DURO_POSTGRES_PASSWORD='...'
+export DURO_ADMIN_DSN='postgres://duro:...@127.0.0.1:5433/duro'
+./scripts/quickstart.sh
+```
 
-# 2. Apply the schema with an administrator/provisioning DSN.
-export ADMIN_DSN="postgres://duro:...@127.0.0.1:5433/duro"
-duro init --postgres "$ADMIN_DSN"
+The wait is important: `docker compose up -d` returns before PostgreSQL is
+ready, so immediately running `duro init` can fail with `connection refused`.
+The script requires a Docker Compose version that supports `up --wait`.
 
-# 3. Create the restricted login roles, then let init grant them.
-#    duro never creates roles or sets passwords; see "Provisioning" below.
-psql "$ADMIN_DSN" -c "CREATE ROLE duro_writer LOGIN PASSWORD 'w...'" \
-                  -c "CREATE ROLE duro_reader LOGIN PASSWORD 'r...'"
-duro init --postgres "$ADMIN_DSN" --writer duro_writer --reader duro_reader
+Duro does not create roles or set passwords. Create the restricted login roles,
+then grant their privileges:
 
-# 4. Append an event and store an artifact, as the writer.
-export DURO_POSTGRES_DSN="postgres://duro_writer:w...@127.0.0.1:5433/duro"
+```sh
+psql "$DURO_ADMIN_DSN" \\
+  -c "CREATE ROLE duro_writer LOGIN PASSWORD '...';" \\
+  -c "CREATE ROLE duro_reader LOGIN PASSWORD '...';"
+duro init --postgres "$DURO_ADMIN_DSN" --writer duro_writer --reader duro_reader
+```
+
+Then use the writer DSN and an artifact store root:
+
+```sh
+export DURO_POSTGRES_DSN='postgres://duro_writer:...@127.0.0.1:5433/duro'
 export DURO_CAS_ROOT=/var/lib/duro/artifacts
 duro event put --type document.tagged --content '{"tag":"reviewed"}'
 duro artifact put --file ./report.pdf
