@@ -4,187 +4,72 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
-	"time"
 )
 
-// validID is a well-formed UUID used as test fixture wherever a valid
-// provided ID is needed but its exact value is not the point of the test.
-const validID = "11111111-1111-1111-1111-111111111111"
+// unicodeSpaces is every character Go's unicode.IsSpace accepts. The
+// database CHECK constraint trims exactly this set (see schema.sql), so a
+// string of only these is blank on both sides of the boundary.
+const unicodeSpaces = "\t\n\v\f\r                  　"
 
-func TestNewValidEventGeneratesID(t *testing.T) {
-	ev, err := New("", "example.note.created", "writer", time.Time{}, json.RawMessage(`{"text":"hi"}`), nil)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if ev.ID == "" {
-		t.Fatal("expected a generated ID")
-	}
-	if ev.OccurredAt.IsZero() {
-		t.Fatal("expected OccurredAt to default to now")
-	}
-}
-
-func TestNewPreservesProvidedID(t *testing.T) {
-	ev, err := New(validID, "example.note.created", "writer", time.Now(), json.RawMessage(`{}`), json.RawMessage(`{}`))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if ev.ID != validID {
-		t.Fatalf("want ID %s, got %s", validID, ev.ID)
-	}
-}
-
-func TestNewWithResourceURIPreservesAbsoluteURI(t *testing.T) {
-	const resourceURI = "cura://palace/wing/room/drawer-id"
-	ev, err := NewWithResourceURI(validID, "document.filed", "writer", time.Now(), json.RawMessage(`{}`), nil, resourceURI)
-	if err != nil {
-		t.Fatalf("NewWithResourceURI: %v", err)
-	}
-	if ev.ResourceURI != resourceURI {
-		t.Fatalf("resource URI = %q, want %q", ev.ResourceURI, resourceURI)
-	}
-}
-
-func TestNewRejectsMalformedID(t *testing.T) {
-	if _, err := New("not-a-uuid", "example.note.created", "writer", time.Now(), nil, nil); err == nil {
-		t.Fatal("expected error for malformed provided id")
-	}
-}
-
-func TestNewDefaultsEmptyContentAndRefsToEmptyObject(t *testing.T) {
-	ev, err := New(validID, "example.note.created", "writer", time.Now(), nil, nil)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if string(ev.Content) != "{}" {
-		t.Fatalf("want default content {}, got %s", ev.Content)
-	}
-	if string(ev.Refs) != "{}" {
-		t.Fatalf("want default refs {}, got %s", ev.Refs)
-	}
-}
-
-func TestNewRejectsMalformedJSON(t *testing.T) {
-	if _, err := New(validID, "type", "actor", time.Now(), json.RawMessage(`{"a":}`), nil); err == nil {
-		t.Fatal("expected error for malformed content JSON")
-	}
-}
-
-func TestNewRejectsScalarContent(t *testing.T) {
-	if _, err := New(validID, "type", "actor", time.Now(), json.RawMessage(`"just a string"`), nil); err == nil {
-		t.Fatal("expected error for scalar content")
-	}
-}
-
-func TestNewRejectsArrayRefs(t *testing.T) {
-	if _, err := New(validID, "type", "actor", time.Now(), nil, json.RawMessage(`[1,2,3]`)); err == nil {
-		t.Fatal("expected error for array refs")
-	}
-}
-
-func TestNewRejectsNullContent(t *testing.T) {
-	if _, err := New(validID, "type", "actor", time.Now(), json.RawMessage(`null`), nil); err == nil {
-		t.Fatal("expected error for null content")
-	}
-}
-
-func TestNewRejectsNullRefs(t *testing.T) {
-	if _, err := New(validID, "type", "actor", time.Now(), nil, json.RawMessage(`null`)); err == nil {
-		t.Fatal("expected error for null refs")
-	}
-}
-
-func TestNewRejectsOversizedContent(t *testing.T) {
-	big := `{"pad":"` + strings.Repeat("x", MaxJSONBytes) + `"}`
-	if _, err := New(validID, "type", "actor", time.Now(), json.RawMessage(big), nil); err == nil {
-		t.Fatal("expected error for oversized content")
-	}
-}
-
-func TestNewRequiresIDTypeAndActor(t *testing.T) {
-	cases := []struct {
-		name, id, typ, actor string
+func TestValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      New
+		wantErr string // substring; "" means valid
 	}{
-		{"missing type", validID, "", "actor"},
-		{"missing actor", validID, "type", ""},
+		{"minimal", New{EventType: "document.tagged"}, ""},
+		{"objects", New{EventType: "a", Content: json.RawMessage(`{"k":1}`), Refs: json.RawMessage(`{}`)}, ""},
+		{"empty type", New{}, "required"},
+		{"ascii blank type", New{EventType: "   \t\n"}, "required"},
+		{"unicode blank type", New{EventType: unicodeSpaces}, "required"},
+		{"unicode padded type", New{EventType: " x　"}, ""},
+		{"invalid utf8 type", New{EventType: string([]byte{0xff, 0xfe})}, "UTF-8"},
+		{"255 bytes", New{EventType: strings.Repeat("a", 255)}, ""},
+		{"256 bytes", New{EventType: strings.Repeat("a", 256)}, "255"},
+		{"255 runes over 255 bytes", New{EventType: strings.Repeat("é", 200)}, "255"},
+		{"content null", New{EventType: "a", Content: json.RawMessage(`null`)}, "content must be a JSON object"},
+		{"content array", New{EventType: "a", Content: json.RawMessage(`[]`)}, "content must be a JSON object"},
+		{"content scalar", New{EventType: "a", Content: json.RawMessage(`3`)}, "content must be a JSON object"},
+		{"content empty string", New{EventType: "a", Content: json.RawMessage(``)}, "content must be a JSON object"},
+		{"refs null", New{EventType: "a", Refs: json.RawMessage(`null`)}, "refs must be a JSON object"},
+		{"refs scalar", New{EventType: "a", Refs: json.RawMessage(`"x"`)}, "refs must be a JSON object"},
+		// Oversized JSON is NOT rejected here: jsonb normalization decides
+		// that, and only PostgreSQL can measure it.
+		{"huge but well-formed content", New{EventType: "a", Content: json.RawMessage(`{"k":"` + strings.Repeat("x", 2<<20) + `"}`)}, ""},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if _, err := New(c.id, c.typ, c.actor, time.Now(), nil, nil); err == nil {
-				t.Fatalf("expected error for %s", c.name)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.in.Validate()
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Fatalf("Validate() = %v, want nil", err)
+			case tt.wantErr != "" && err == nil:
+				t.Fatalf("Validate() = nil, want error containing %q", tt.wantErr)
+			case tt.wantErr != "" && !strings.Contains(err.Error(), tt.wantErr):
+				t.Fatalf("Validate() = %v, want error containing %q", err, tt.wantErr)
 			}
 		})
 	}
 }
 
-func TestValidateRejectsNonCanonicalUUID(t *testing.T) {
-	// uuid.Parse also accepts a bare 32 hex digit form with no hyphens as
-	// the "same" UUID. Lowercasing that form doesn't add the missing
-	// hyphens, so it must still be rejected: only canonical hyphenated text
-	// is accepted, else two differently-spelled IDs could alias one event.
-	noHyphens := strings.ReplaceAll(validID, "-", "")
-	ev := Event{
-		ID: noHyphens, EventType: "t", Actor: "a",
-		OccurredAt: time.Now(), Content: json.RawMessage(`{}`), Refs: json.RawMessage(`{}`),
+func TestDefaultsOnlyForNil(t *testing.T) {
+	n := New{EventType: "a"}
+	if got := string(n.ContentOrDefault()); got != "{}" {
+		t.Errorf("ContentOrDefault() = %q, want {}", got)
 	}
-	if err := ev.Validate(); err == nil {
-		t.Fatal("expected error for non-hyphenated (non-canonical) UUID")
+	if got := string(n.RefsOrDefault()); got != "{}" {
+		t.Errorf("RefsOrDefault() = %q, want {}", got)
 	}
-}
-
-func TestValidateRejectsUppercaseUUID(t *testing.T) {
-	// uuid.Parse also accepts uppercase hex digits as the "same" UUID.
-	// Lowercasing the input before comparing would let an uppercase spelling
-	// alias a lowercase one; only the exact canonical spelling is accepted.
-	const mixedCaseID = "1a111111-1111-1111-1111-111111111111"
-	upper := strings.ToUpper(mixedCaseID)
-	ev := Event{
-		ID: upper, EventType: "t", Actor: "a",
-		OccurredAt: time.Now(), Content: json.RawMessage(`{}`), Refs: json.RawMessage(`{}`),
+	set := New{EventType: "a", Content: json.RawMessage(`{"k":1}`), Refs: json.RawMessage(`{"r":2}`)}
+	if got := string(set.ContentOrDefault()); got != `{"k":1}` {
+		t.Errorf("ContentOrDefault() = %q, want passthrough", got)
 	}
-	if err := ev.Validate(); err == nil {
-		t.Fatal("expected error for uppercase (non-canonical) UUID")
+	if got := string(set.RefsOrDefault()); got != `{"r":2}` {
+		t.Errorf("RefsOrDefault() = %q, want passthrough", got)
 	}
-}
-
-func TestValidateRejectsEmptyID(t *testing.T) {
-	ev := Event{ID: "", EventType: "t", Actor: "a", OccurredAt: time.Now(), Content: json.RawMessage(`{}`), Refs: json.RawMessage(`{}`)}
-	if err := ev.Validate(); err == nil {
-		t.Fatal("expected error for empty id")
-	}
-}
-
-func TestValidateResourceURIRequiresAbsoluteURIAndPreservesExactValue(t *testing.T) {
-	for _, resourceURI := range []string{
-		"cura://palace/wing/room/drawer-id",
-		"rador://deliveries/2026-09-12",
-		"urn:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-	} {
-		ev := Event{ID: validID, EventType: "document.filed", Actor: "writer", OccurredAt: time.Now(), Content: json.RawMessage(`{}`), Refs: json.RawMessage(`{}`), ResourceURI: resourceURI}
-		if err := ev.Validate(); err != nil {
-			t.Fatalf("Validate(%q): %v", resourceURI, err)
-		}
-		if ev.ResourceURI != resourceURI {
-			t.Fatalf("resource URI changed from %q to %q", resourceURI, ev.ResourceURI)
-		}
-	}
-	for _, resourceURI := range []string{"relative/path", "/absolute/path-without-scheme", "https://example.invalid/a b", "\nhttps://example.invalid", "https://example.invalid/\x00"} {
-		ev := Event{ID: validID, EventType: "document.filed", Actor: "writer", OccurredAt: time.Now(), Content: json.RawMessage(`{}`), Refs: json.RawMessage(`{}`), ResourceURI: resourceURI}
-		if err := ev.Validate(); err == nil {
-			t.Fatalf("Validate(%q) accepted invalid resource URI", resourceURI)
-		}
-	}
-}
-
-func TestValidateAbsoluteURI(t *testing.T) {
-	for _, uri := range []string{"file:///data/run-1/output.bin", "https://example.invalid/a", "urn:sha256:abc"} {
-		if err := ValidateAbsoluteURI(uri); err != nil {
-			t.Fatalf("ValidateAbsoluteURI(%q): %v", uri, err)
-		}
-	}
-	for _, uri := range []string{"", "relative/path", "file:///data/a b", "\nhttps://example.invalid"} {
-		if err := ValidateAbsoluteURI(uri); err == nil {
-			t.Fatalf("ValidateAbsoluteURI(%q) = nil error, want rejection", uri)
-		}
+	// A non-nil empty value is not defaulted: it stays invalid input.
+	empty := New{EventType: "a", Content: json.RawMessage(``)}
+	if got := string(empty.ContentOrDefault()); got != "" {
+		t.Errorf("ContentOrDefault() = %q, want empty (not defaulted)", got)
 	}
 }

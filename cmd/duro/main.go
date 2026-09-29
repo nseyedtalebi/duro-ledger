@@ -1,614 +1,508 @@
-// Command duro is the minimal client for the SQLite-local /
-// PostgreSQL-canonical event ledger: append queues generic events, file
-// queues canonical document bodies, init applies administrator-owned schema,
-// sync drains the queue, and pull refreshes the local replica. It has no
-// subcommand framework beyond stdlib flag, and no lineage/CAS-era commands.
+// Command duro is the minimal client for Duro's PostgreSQL event ledger and
+// filesystem artifact store: init provisions the schema, append records a
+// generic event, and artifact put/get store and retrieve content-addressed
+// files. There is no local queue, no sync/pull, and no subcommand
+// framework beyond stdlib flag.
 package main
 
 import (
-	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"mime"
 	"os"
-	"os/user"
-	"path/filepath"
-	"strings"
 	"time"
-	"unicode/utf8"
 
-	"github.com/nseyedtalebi/duro-ledger/pkg/blob"
-	"github.com/nseyedtalebi/duro-ledger/pkg/blobconfig"
+	"github.com/nseyedtalebi/duro-ledger/pkg/artifact"
+	"github.com/nseyedtalebi/duro-ledger/pkg/cas"
 	"github.com/nseyedtalebi/duro-ledger/pkg/event"
-	"github.com/nseyedtalebi/duro-ledger/pkg/knowledgegraph"
-	"github.com/nseyedtalebi/duro-ledger/pkg/local"
 	"github.com/nseyedtalebi/duro-ledger/pkg/postgres"
-	"github.com/nseyedtalebi/duro-ledger/pkg/sync"
 )
 
-// defaultPullBatch bounds how many canonical rows Pull fetches per round
-// trip. It is an internal implementation detail, not a flag: the plan's
-// command surface exposes no batch-size knob.
-const defaultPullBatch = 500
+// errReported marks an error whose machine-readable form has already been
+// printed to stderr by the caller; main must still exit nonzero for it but
+// must not print it again.
+var errReported = errors.New("duro: already reported")
+
+const rootUsage = `Duro: a PostgreSQL event ledger and filesystem artifact store.
+
+Usage:
+  duro init      --postgres DSN [--writer ROLE] [--reader ROLE]
+  duro append    --postgres DSN --type EVENT_TYPE [--content JSON] [--refs JSON]
+  duro artifact put  --postgres DSN --root DIR --file PATH
+  duro artifact get  --root DIR --sha256 sha256:HEX [--out PATH]
+  duro help | --help | -h
+
+Run "duro <command> --help", "duro artifact <subcommand> --help", or
+"duro help <command>" for details on a specific command. See README.md for
+the full contract, output schemas, error schemas, and operator setup (role
+provisioning SQL, compose.yaml, PostgreSQL version requirements).
+
+DSN flags fall back to DURO_POSTGRES_DSN; --root flags fall back to
+DURO_CAS_ROOT.`
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		if err == flag.ErrHelp {
+			os.Exit(0)
+		}
+		if !errors.Is(err, errReported) {
+			fmt.Fprintln(os.Stderr, err)
+		}
 		os.Exit(1)
 	}
 }
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: duro init|append|file|sync|pull|read|list|kg|artifact")
+		fmt.Println(rootUsage)
+		return nil
 	}
-	if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
-		_, err := fmt.Fprintln(os.Stdout, "Usage: duro init|append|file|sync|pull|read|list|kg|artifact")
-		return err
+	// "duro help <command...>" routes to that command's own --help output
+	// instead of always printing the root usage, so e.g. "duro help init"
+	// shows init's flags rather than the unrelated root summary.
+	if args[0] == "help" && len(args) > 1 {
+		return run(append(append([]string{}, args[1:]...), "--help"))
 	}
 	switch args[0] {
+	case "help", "--help", "-h":
+		fmt.Println(rootUsage)
+		return nil
 	case "init":
 		return runInit(args[1:])
 	case "append":
 		return runAppend(args[1:])
-	case "file":
-		return runFile(args[1:])
-	case "sync":
-		return runSync(args[1:])
-	case "pull":
-		return runPull(args[1:])
-	case "read":
-		return runRead(args[1:])
-	case "list":
-		return runList(args[1:])
-	case "kg":
-		return runKG(args[1:])
 	case "artifact":
 		return runArtifact(args[1:])
 	default:
-		return fmt.Errorf("unknown command %q", args[0])
+		return fmt.Errorf("unknown command %q; run \"duro help\"", args[0])
 	}
 }
 
-type initResult struct {
-	Initialized bool `json:"initialized"`
+func envFallback(flagVal, envVar string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	return os.Getenv(envVar)
 }
+
+func postgresDSN(flagVal string) string { return envFallback(flagVal, "DURO_POSTGRES_DSN") }
+func casRoot(flagVal string) string     { return envFallback(flagVal, "DURO_CAS_ROOT") }
+
+// --- init ---
+
+const initUsage = `Usage: duro init --postgres DSN [--writer ROLE] [--reader ROLE]
+
+Applies Duro's canonical schema (a single "events" table) using an
+administrator/provisioning connection. Idempotent: run again against an
+already-initialized, contract-compliant database, it does nothing and
+succeeds. Run against a database whose public.events table does not match
+the current contract shape (for example, an older Duro schema), it returns
+an error and makes no changes -- it never drops or alters existing data.
+
+Flags:
+  --postgres DSN   Administrator/provisioning PostgreSQL DSN (required).
+                    Falls back to DURO_POSTGRES_DSN.
+  --writer ROLE    Optional: grant an existing login ROLE the minimum
+                    privilege to append events (column-level INSERT on
+                    event_type/content/refs only; it cannot set id,
+                    received_at, or actor).
+  --reader ROLE    Optional: grant an existing login ROLE SELECT on the
+                    event table and nothing else.
+
+Output (stdout, on success): {"initialized":true}
+
+Errors: connection failure, insufficient administrator privilege, or an
+incompatible existing public.events table, printed to stderr with exit
+code 1.
+
+Example:
+  duro init --postgres "postgres://admin@localhost:5432/duro" \
+    --writer duro_writer --reader duro_reader`
 
 func runInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	dsn := fs.String("postgres", "", "PostgreSQL administrator/provisioning DSN")
+	fs.Usage = func() { fmt.Fprintln(os.Stderr, initUsage) }
+	dsn := fs.String("postgres", "", "administrator/provisioning PostgreSQL DSN")
+	writer := fs.String("writer", "", "existing login role to grant writer (append-only) privilege")
+	reader := fs.String("reader", "", "existing login role to grant reader (select-only) privilege")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *dsn == "" {
-		return fmt.Errorf("--postgres is required")
+	if fs.NArg() > 0 {
+		fs.Usage()
+		return fmt.Errorf("init: unexpected argument(s): %v", fs.Args())
 	}
-	if err := postgres.Initialize(*dsn); err != nil {
+	resolvedDSN := postgresDSN(*dsn)
+	if resolvedDSN == "" {
+		fs.Usage()
+		return fmt.Errorf("init: --postgres is required (or set DURO_POSTGRES_DSN)")
+	}
+	if err := postgres.Initialize(resolvedDSN); err != nil {
 		return err
 	}
-	return json.NewEncoder(os.Stdout).Encode(initResult{Initialized: true})
+	if *writer != "" {
+		if err := postgres.ProvisionWriter(resolvedDSN, *writer); err != nil {
+			return fmt.Errorf("init: provisioning writer %q: %w", *writer, err)
+		}
+	}
+	if *reader != "" {
+		if err := postgres.ProvisionReader(resolvedDSN, *reader); err != nil {
+			return fmt.Errorf("init: provisioning reader %q: %w", *reader, err)
+		}
+	}
+	return json.NewEncoder(os.Stdout).Encode(map[string]bool{"initialized": true})
 }
 
-type appendResult struct {
-	EventID string `json:"event_id"`
-	Fresh   bool   `json:"fresh"`
-}
+// --- append ---
+
+const appendUsage = `Usage: duro append --postgres DSN --type EVENT_TYPE [--content JSON] [--refs JSON]
+
+Appends one event to the canonical ledger in a single database transaction.
+PostgreSQL assigns id (UUIDv7), received_at, and actor (the authenticated
+login role); this command cannot override them. Success is only reported
+after the transaction commits.
+
+Flags:
+  --postgres DSN     PostgreSQL DSN (required). Falls back to
+                      DURO_POSTGRES_DSN. An ordinary writer-role DSN is
+                      sufficient; no administrator privilege is needed.
+  --type EVENT_TYPE  Required. Nonblank, at most 255 UTF-8 bytes.
+  --content JSON     Optional JSON object; defaults to {}. An explicit
+                      JSON null is invalid. At most 1 MiB as UTF-8
+                      jsonb::text.
+  --refs JSON        Optional JSON object; defaults to {}. Same rules as
+                      --content.
+
+Output (stdout, on success): the complete stored event as JSON:
+  {"id":"...","received_at":"...","event_type":"...","actor":"...",
+   "content":{...},"refs":{...}}
+
+Errors (stderr, exit code 1): validation failures (missing/oversized
+--type, malformed --content/--refs) are reported as a plain message before
+any database connection is opened. A confirmed transaction failure (e.g. a
+value PostgreSQL itself rejects) and a lost connection with an uncertain
+commit outcome are both reported as plain messages; the process exits
+nonzero either way and performs no automatic retry. Repeating the same
+--type/--content/--refs creates a new, distinct event -- retrying after any
+failure is an explicit, separate invocation. If the failure was a lost
+connection (uncertain/"unknown" outcome), the original append may have
+actually committed despite never confirming; retrying anyway appends a
+second event regardless, so an "unknown" outcome can leave two observation
+events for what the caller intended as one call. Only retry if a duplicate
+event is acceptable, or read the ledger first to check.
+
+Example:
+  duro append --postgres "postgres://writer@localhost:5432/duro" \
+    --type document.tagged --content '{"tag":"reviewed"}'`
 
 func runAppend(args []string) error {
 	fs := flag.NewFlagSet("append", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	localPath := fs.String("local", "", "local SQLite queue path")
+	fs.Usage = func() { fmt.Fprintln(os.Stderr, appendUsage) }
+	dsn := fs.String("postgres", "", "PostgreSQL DSN")
 	eventType := fs.String("type", "", "event type")
-	actor := fs.String("actor", "", "actor claim; canonical storage binds new IDs to the authenticated PostgreSQL role")
-	content := fs.String("content", "", "event content, a JSON object")
-	refs := fs.String("refs", "", "event refs, a JSON object")
-	resourceURI := fs.String("resource-uri", "", "optional absolute logical resource URI")
+	content := fs.String("content", "", "event content, a JSON object (default {})")
+	refs := fs.String("refs", "", "event refs, a JSON object (default {})")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *localPath == "" || *eventType == "" || *content == "" {
-		return fmt.Errorf("--local, --type, and --content are required")
+	if fs.NArg() > 0 {
+		fs.Usage()
+		return fmt.Errorf("append: unexpected argument(s): %v", fs.Args())
+	}
+	resolvedDSN := postgresDSN(*dsn)
+	if resolvedDSN == "" || *eventType == "" {
+		fs.Usage()
+		return fmt.Errorf("append: --postgres (or DURO_POSTGRES_DSN) and --type are required")
 	}
 
-	var refsJSON json.RawMessage
-	if *refs != "" {
-		refsJSON = json.RawMessage(*refs)
-	}
-	ev, err := event.NewWithResourceURI("", *eventType, actorName(*actor), time.Time{}, json.RawMessage(*content), refsJSON, *resourceURI)
-	if err != nil {
-		return err
-	}
-
-	s, err := local.Open(*localPath)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-
-	fresh, err := s.Enqueue(ev)
-	if err != nil {
-		return err
-	}
-	return json.NewEncoder(os.Stdout).Encode(appendResult{EventID: ev.ID, Fresh: fresh})
-}
-
-// runFile records a source-addressed event with exact body bytes in the blob
-// store. document.filed remains the default; callers can name a more precise
-// type such as dataset.filed without changing Duro's generic blob path.
-func runFile(args []string) error {
-	fs := flag.NewFlagSet("file", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	localPath := fs.String("local", "", "local SQLite queue path")
-	bodyPath := fs.String("body", "", "document body file")
-	source := fs.String("source", "", "source reference")
-	resourceURI := fs.String("resource-uri", "", "optional absolute logical resource URI")
-	eventType := fs.String("type", "document.filed", "event type")
-	mediaType := fs.String("media-type", "", "body media type")
-	blobStore := fs.String("blob-store", blobconfig.PostgresKind, "canonical blob store: postgres or filesystem")
-	blobRoot := fs.String("blob-root", "", "absolute filesystem blob store root")
-	actor := fs.String("actor", "", "actor claim; canonical storage binds new IDs to the authenticated PostgreSQL role")
-	id := fs.String("id", "", "optional client-generated event UUID for retry")
-	occurredAt := fs.String("occurred-at", "", "optional RFC3339 occurrence time for retry")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *localPath == "" || *bodyPath == "" || *source == "" {
-		return fmt.Errorf("--local, --body, and --source are required")
-	}
-	if err := blobconfig.Validate(*blobStore, *blobRoot); err != nil {
-		return err
-	}
-	content, err := json.Marshal(map[string]string{"source": *source})
-	if err != nil {
-		return err
-	}
-	if *mediaType == "" {
-		*mediaType = mime.TypeByExtension(filepath.Ext(*bodyPath))
-		if *mediaType == "" {
-			*mediaType = "application/octet-stream"
+	var contentSet, refsSet bool
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "content":
+			contentSet = true
+		case "refs":
+			refsSet = true
 		}
-	}
-	when := time.Time{}
-	if *occurredAt != "" {
-		when, err = time.Parse(time.RFC3339Nano, *occurredAt)
-		if err != nil {
-			return fmt.Errorf("--occurred-at: %w", err)
-		}
-	}
-	ev, err := event.NewWithResourceURI(*id, *eventType, actorName(*actor), when, content, nil, *resourceURI)
-	if err != nil {
-		return err
-	}
-
-	s, err := local.Open(*localPath)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	var fresh bool
-	if *blobStore == blobconfig.FilesystemKind {
-		backend, err := blob.NewFilesystemStore(*blobRoot)
-		if err != nil {
-			return err
-		}
-		digest, size, err := backend.PutFile(*bodyPath)
-		if err != nil {
-			return err
-		}
-		fresh, err = s.EnqueueWithBlobRef(ev, digest, size, *mediaType)
-	} else {
-		body, err := os.ReadFile(*bodyPath)
-		if err != nil {
-			return err
-		}
-		fresh, err = s.EnqueueWithBlob(ev, body, *mediaType)
-	}
-	if err != nil {
-		return err
-	}
-	return json.NewEncoder(os.Stdout).Encode(appendResult{EventID: ev.ID, Fresh: fresh})
-}
-
-// actorName uses an explicit actor when supplied, then DURO_ACTOR, and
-// otherwise falls back to the local OS username for offline queue records.
-func actorName(explicit string) string {
-	if explicit == "" {
-		explicit = os.Getenv("DURO_ACTOR")
-	}
-	if explicit != "" {
-		return explicit
-	}
-	if u, err := user.Current(); err == nil && u.Username != "" {
-		return u.Username
-	}
-	return "unknown"
-}
-
-type syncResult struct {
-	Accepted       int `json:"accepted"`
-	AlreadyPresent int `json:"already_present"`
-	Conflict       int `json:"conflict"`
-	Rejected       int `json:"rejected"`
-}
-
-func runSync(args []string) error {
-	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	localPath := fs.String("local", "", "local SQLite queue path")
-	dsn := fs.String("postgres", "", "PostgreSQL canonical store DSN")
-	blobStore := fs.String("blob-store", blobconfig.PostgresKind, "canonical blob store: postgres or filesystem")
-	blobRoot := fs.String("blob-root", "", "absolute filesystem blob store root")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *localPath == "" || *dsn == "" {
-		return fmt.Errorf("--local and --postgres are required")
-	}
-	if err := blobconfig.Validate(*blobStore, *blobRoot); err != nil {
-		return err
-	}
-
-	loc, err := local.Open(*localPath)
-	if err != nil {
-		return err
-	}
-	defer loc.Close()
-	rem, err := postgres.Open(*dsn)
-	if err != nil {
-		return err
-	}
-	defer rem.Close()
-
-	var res sync.PushResult
-	if *blobStore == blobconfig.PostgresKind {
-		res, err = sync.Push(loc, rem, 0)
-	} else {
-		backend, openErr := blobconfig.Open(*blobStore, *blobRoot, rem)
-		if openErr != nil {
-			return openErr
-		}
-		res, err = sync.PushWithBlobStore(loc, rem, backend, 0)
-	}
-	if err != nil {
-		return err
-	}
-	return json.NewEncoder(os.Stdout).Encode(syncResult{
-		Accepted:       res.Accepted,
-		AlreadyPresent: res.AlreadyPresent,
-		Conflict:       res.Conflict,
-		Rejected:       res.Rejected,
 	})
-}
-
-type pullResult struct {
-	Applied int   `json:"applied"`
-	Cursor  int64 `json:"cursor"`
-}
-
-func runPull(args []string) error {
-	fs := flag.NewFlagSet("pull", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	localPath := fs.String("local", "", "local SQLite queue path")
-	dsn := fs.String("postgres", "", "PostgreSQL canonical store DSN")
-	if err := fs.Parse(args); err != nil {
-		return err
+	n := event.New{
+		EventType: *eventType,
+		Content:   rawJSONFlag(*content, contentSet),
+		Refs:      rawJSONFlag(*refs, refsSet),
 	}
-	if *localPath == "" || *dsn == "" {
-		return fmt.Errorf("--local and --postgres are required")
+	if err := n.Validate(); err != nil {
+		fs.Usage()
+		return err
 	}
 
-	loc, err := local.Open(*localPath)
-	if err != nil {
-		return err
-	}
-	defer loc.Close()
-	rem, err := postgres.Open(*dsn)
-	if err != nil {
-		return err
-	}
-	defer rem.Close()
-
-	n, err := sync.Pull(rem, loc, defaultPullBatch)
-	if err != nil {
-		return err
-	}
-	cursor, err := loc.Cursor()
-	if err != nil {
-		return err
-	}
-	return json.NewEncoder(os.Stdout).Encode(pullResult{Applied: n, Cursor: cursor})
-}
-
-type readResult struct {
-	Found       bool   `json:"found"`
-	Sequence    int64  `json:"sequence,omitempty"`
-	EventID     string `json:"event_id,omitempty"`
-	Source      string `json:"source,omitempty"`
-	ResourceURI string `json:"resource_uri,omitempty"`
-	BlobSHA256  string `json:"blob_sha256,omitempty"`
-	MediaType   string `json:"media_type,omitempty"`
-	Body        string `json:"body,omitempty"`
-}
-
-func runRead(args []string) error {
-	fs := flag.NewFlagSet("read", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	dsn := fs.String("postgres", "", "PostgreSQL canonical store DSN")
-	source := fs.String("source", "", "opaque source reference")
-	maxBytes := fs.Int64("max-bytes", 1<<20, "maximum document body bytes")
-	blobStore := fs.String("blob-store", blobconfig.PostgresKind, "canonical blob store: postgres or filesystem")
-	blobRoot := fs.String("blob-root", "", "absolute filesystem blob store root")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *dsn == "" || *source == "" {
-		return fmt.Errorf("--postgres and --source are required")
-	}
-	if err := blobconfig.Validate(*blobStore, *blobRoot); err != nil {
-		return err
-	}
-	store, err := postgres.Open(*dsn)
+	store, err := postgres.Open(resolvedDSN)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	backend, err := blobconfig.Open(*blobStore, *blobRoot, store)
+
+	se, err := store.Append(n)
 	if err != nil {
 		return err
 	}
-	doc, ok, err := store.ReadLatestDocumentMetadata(*source)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return json.NewEncoder(os.Stdout).Encode(readResult{Found: false})
-	}
-	doc.Body, err = backend.Read(doc.BlobSHA256, *maxBytes)
-	if err != nil {
-		return err
-	}
-	if !utf8.Valid(doc.Body) {
-		return fmt.Errorf("document %s is not UTF-8 text", doc.EventID)
-	}
-	return json.NewEncoder(os.Stdout).Encode(readResult{
-		Found: true, Sequence: doc.Sequence, EventID: doc.EventID, Source: doc.Source, ResourceURI: doc.ResourceURI,
-		BlobSHA256: doc.BlobSHA256, MediaType: doc.MediaType, Body: string(doc.Body),
-	})
+	return json.NewEncoder(os.Stdout).Encode(toEventJSON(se))
 }
 
-func runList(args []string) error {
-	fs := flag.NewFlagSet("list", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	dsn := fs.String("postgres", "", "PostgreSQL canonical store DSN")
-	after := fs.Int64("after", 0, "exclusive canonical sequence cursor")
-	limit := fs.Int("limit", 100, "maximum current documents to return")
-	if err := fs.Parse(args); err != nil {
-		return err
+// rawJSONFlag returns val as the raw JSON a caller supplied for a --content
+// or --refs flag, or nil if the flag was never set on the command line.
+// event.New defaults a nil field to {}; an explicitly empty string ("--content
+// ”") is preserved as-is so it fails JSON-object validation instead of being
+// silently treated as omitted.
+func rawJSONFlag(val string, set bool) json.RawMessage {
+	if !set {
+		return nil
 	}
-	if *dsn == "" {
-		return fmt.Errorf("--postgres is required")
-	}
-	store, err := postgres.Open(*dsn)
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-	docs, err := store.ListLatestDocuments(*after, *limit)
-	if err != nil {
-		return err
-	}
-
-	result := struct {
-		Documents []readResult `json:"documents"`
-		Cursor    int64        `json:"cursor"`
-	}{Cursor: *after}
-	for _, doc := range docs {
-		result.Documents = append(result.Documents, readResult{
-			Found: true, Sequence: doc.Sequence, EventID: doc.EventID, Source: doc.Source, ResourceURI: doc.ResourceURI,
-			BlobSHA256: doc.BlobSHA256, MediaType: doc.MediaType,
-		})
-		result.Cursor = doc.Sequence
-	}
-	return json.NewEncoder(os.Stdout).Encode(result)
+	return json.RawMessage(val)
 }
 
-// runArtifact dispatches the filesystem-CAS artifact catalog subcommands.
+// eventJSON is the wire shape of a stored event, shared by "append" and
+// "artifact put" so the encoding lives in one place.
+type eventJSON struct {
+	ID         string          `json:"id"`
+	ReceivedAt string          `json:"received_at"`
+	EventType  string          `json:"event_type"`
+	Actor      string          `json:"actor"`
+	Content    json.RawMessage `json:"content"`
+	Refs       json.RawMessage `json:"refs"`
+}
+
+func toEventJSON(se postgres.StoredEvent) eventJSON {
+	return eventJSON{
+		ID:         se.ID,
+		ReceivedAt: se.ReceivedAt.Format(time.RFC3339Nano),
+		EventType:  se.EventType,
+		Actor:      se.Actor,
+		Content:    se.Content,
+		Refs:       se.Refs,
+	}
+}
+
+// --- artifact ---
+
+const artifactUsage = `Usage: duro artifact put|get --help
+
+Subcommands:
+  put   Store a file in the content-addressed filesystem store and record
+         its observation as an event.
+  get   Retrieve a stored file by its digest.
+
+Run "duro artifact put --help" or "duro artifact get --help" for details.`
+
 func runArtifact(args []string) error {
-	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
-		_, err := fmt.Fprintln(os.Stdout, "Usage: duro artifact put|verify|locate")
-		return err
+	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
+		fmt.Println(artifactUsage)
+		return nil
 	}
 	switch args[0] {
 	case "put":
 		return runArtifactPut(args[1:])
-	case "verify":
-		return runArtifactVerify(args[1:])
-	case "locate":
-		return runArtifactLocate(args[1:])
+	case "get":
+		return runArtifactGet(args[1:])
 	default:
-		return fmt.Errorf("unknown artifact subcommand %q", args[0])
+		return fmt.Errorf("unknown artifact subcommand %q; run \"duro artifact --help\"", args[0])
 	}
 }
 
-// locatorList collects a repeatable --locator flag. stdlib flag has no
-// built-in list type and one observation per invocation would be worse.
-type locatorList []string
+const artifactPutUsage = `Usage: duro artifact put --postgres DSN --root DIR --file PATH
 
-func (l *locatorList) String() string     { return strings.Join(*l, ",") }
-func (l *locatorList) Set(v string) error { *l = append(*l, v); return nil }
+Streams --file into the content-addressed filesystem store rooted at
+--root, then appends an artifact.observed event to the canonical ledger.
+Both steps must succeed for a full success; see "Errors" below for what
+happens when only the first does.
 
-type artifactPutResult struct {
-	SHA256 string `json:"sha256"`
-	Size   int64  `json:"size_bytes"`
-	// Fresh reports whether this call created the catalog row. A retry
-	// after a failed catalog write reports fresh again; a retry after a
-	// complete put reports false, having deduplicated the bytes.
-	Fresh    bool     `json:"fresh"`
-	Locators []string `json:"locators,omitempty"`
-}
+Identity is sha256:<64 lowercase hex characters>. Storage is content-
+addressed and deduplicated: putting bytes that already exist verifies the
+existing artifact and reuses it rather than storing a second copy, but
+every successful put -- including a duplicate-content put -- appends its
+own new artifact.observed event.
 
-// runArtifactPut persists bytes in the existing filesystem CAS first, and only
-// then catalogs their canonical metadata and source locator observations. That
-// order is what makes a partial failure retry-safe: the bytes are already
-// deduplicated by digest, so rerunning writes only the missing catalog row.
+Flags:
+  --postgres DSN   PostgreSQL DSN (required). Falls back to
+                    DURO_POSTGRES_DSN.
+  --root DIR       Content-addressed store root directory (required).
+                    Falls back to DURO_CAS_ROOT. Created if missing.
+  --file PATH      Source file to store (required). Must be a regular
+                    file whose length does not change while it is being
+                    read.
+
+Output (stdout, on full success):
+  {"digest":"sha256:...","size_bytes":N,
+   "event":{"id":"...","received_at":"...","event_type":"artifact.observed",
+            "actor":"...","content":{"digest":"sha256:...","size_bytes":N,
+            "source_host":"...","source_path":"/abs/path"},"refs":{}}}
+
+Errors:
+  - If storing or verifying the bytes themselves fails (read/write error,
+    length mismatch, or existing-artifact corruption at that digest) before
+    anything is durably linked into the store, nothing is recorded: no
+    artifact, no event. Reported as a plain message to stderr, exit code 1.
+    In the narrow case where the bytes were already linked into place but a
+    following directory-sync fails, the artifact MAY exist on disk even
+    though this call reports a plain storage error and appended no event --
+    content-addressing makes a later retry safe either way (see below).
+  - If the bytes are stored (or verified as an existing duplicate) but the
+    event append fails or its commit outcome is unknown, the artifact is
+    retained on disk and a JSON error object is printed to stderr instead
+    of a plain message, then the process exits 1:
+      {"digest":"sha256:...","size_bytes":N,"artifact_stored":true,
+       "event_outcome":"not_committed"|"unknown","error":"..."}
+    Retrying "artifact put" with the same --file is always safe as far as
+    the bytes go (they deduplicate against the digest already on disk) and
+    appends a new observation event. If event_outcome was "unknown", the
+    earlier append may have actually committed despite the lost
+    acknowledgment; retrying still appends another event regardless, so an
+    "unknown" outcome can leave two observation events on disk for what was
+    intended as one put. Only retry if that duplicate is acceptable, or
+    read the ledger first to check.
+
+Side effects: creates files and up to two levels of sharding directories
+under --root; no existing file under --root is ever overwritten.
+
+Example:
+  duro artifact put --postgres "postgres://writer@localhost:5432/duro" \
+    --root /var/lib/duro/artifacts --file ./report.pdf`
+
 func runArtifactPut(args []string) error {
 	fs := flag.NewFlagSet("artifact put", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	dsn := fs.String("postgres", "", "PostgreSQL canonical store DSN")
-	blobRoot := fs.String("blob-root", "", "absolute filesystem blob store root")
-	file := fs.String("file", "", "artifact file to catalog")
-	var locators locatorList
-	fs.Var(&locators, "locator", "absolute source locator URI where these bytes were observed; repeatable")
+	fs.Usage = func() { fmt.Fprintln(os.Stderr, artifactPutUsage) }
+	dsn := fs.String("postgres", "", "PostgreSQL DSN")
+	root := fs.String("root", "", "content-addressed store root directory")
+	file := fs.String("file", "", "source file to store")
 	if err := fs.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return nil
+		return err
+	}
+	if fs.NArg() > 0 {
+		fs.Usage()
+		return fmt.Errorf("artifact put: unexpected argument(s): %v", fs.Args())
+	}
+	resolvedDSN := postgresDSN(*dsn)
+	resolvedRoot := casRoot(*root)
+	if resolvedDSN == "" || resolvedRoot == "" || *file == "" {
+		fs.Usage()
+		return fmt.Errorf("artifact put: --postgres, --root (or their env fallbacks), and --file are required")
+	}
+
+	store, err := cas.Open(resolvedRoot)
+	if err != nil {
+		return err
+	}
+	ledger, err := postgres.Open(resolvedDSN)
+	if err != nil {
+		return err
+	}
+	defer ledger.Close()
+
+	result, err := artifact.Put(store, ledger, *file)
+	if err != nil {
+		var pe *artifact.PutError
+		if errors.As(err, &pe) {
+			enc := json.NewEncoder(os.Stderr)
+			_ = enc.Encode(struct {
+				Digest         string `json:"digest"`
+				Size           int64  `json:"size_bytes"`
+				ArtifactStored bool   `json:"artifact_stored"`
+				EventOutcome   string `json:"event_outcome"`
+				Error          string `json:"error"`
+			}{pe.Digest, pe.Size, pe.ArtifactStored, pe.EventOutcome, pe.Err.Error()})
+			return errReported
 		}
-		return err
-	}
-	if *dsn == "" || *file == "" {
-		return fmt.Errorf("--postgres and --file are required")
-	}
-	if err := blobconfig.Validate(blobconfig.FilesystemKind, *blobRoot); err != nil {
-		return err
-	}
-	for _, locator := range locators {
-		if err := event.ValidateAbsoluteURI(locator); err != nil {
-			return fmt.Errorf("--locator must be an absolute URI: %w", err)
-		}
-	}
-
-	backend, err := blob.NewFilesystemStore(*blobRoot)
-	if err != nil {
-		return err
-	}
-	digest, size, err := backend.PutFile(*file)
-	if err != nil {
-		return err
-	}
-
-	store, err := postgres.Open(*dsn)
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-	// PutFile streamed these bytes through SHA-256 on the way in, so the
-	// catalog row starts out verified rather than never-checked.
-	fresh, err := store.CatalogArtifact(digest, size, locators, time.Now().UTC())
-	if err != nil {
-		return err
-	}
-	return json.NewEncoder(os.Stdout).Encode(artifactPutResult{SHA256: digest, Size: size, Fresh: fresh, Locators: locators})
-}
-
-type artifactVerifyResult struct {
-	SHA256         string    `json:"sha256"`
-	Size           int64     `json:"size_bytes"`
-	Verified       bool      `json:"verified"`
-	LastVerifiedAt time.Time `json:"last_verified_at"`
-}
-
-// runArtifactVerify verifies exactly one cataloged artifact: canonical
-// digest/size metadata first, then the filesystem bytes through the existing
-// CAS check, and only on success is the verification time updated.
-func runArtifactVerify(args []string) error {
-	fs := flag.NewFlagSet("artifact verify", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	dsn := fs.String("postgres", "", "PostgreSQL canonical store DSN")
-	blobRoot := fs.String("blob-root", "", "absolute filesystem blob store root")
-	digest := fs.String("sha256", "", "lowercase hex SHA-256 digest of the artifact to verify")
-	if err := fs.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return nil
-		}
-		return err
-	}
-	if *dsn == "" || *digest == "" {
-		return fmt.Errorf("--postgres and --sha256 are required")
-	}
-	if err := blobconfig.Validate(blobconfig.FilesystemKind, *blobRoot); err != nil {
-		return err
-	}
-
-	store, err := postgres.Open(*dsn)
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-	meta, ok, err := store.ReadBlobMetadata(*digest)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("artifact %s is not cataloged", *digest)
-	}
-	backend, err := blob.NewFilesystemStore(*blobRoot)
-	if err != nil {
-		return err
-	}
-	if err := backend.Verify(meta.SHA256, meta.Size); err != nil {
-		return err
-	}
-	verifiedAt := time.Now().UTC()
-	if err := store.MarkBlobVerified(meta.SHA256, verifiedAt); err != nil {
-		return err
-	}
-	return json.NewEncoder(os.Stdout).Encode(artifactVerifyResult{
-		SHA256: meta.SHA256, Size: meta.Size, Verified: true, LastVerifiedAt: verifiedAt,
-	})
-}
-
-func runArtifactLocate(args []string) error {
-	fs := flag.NewFlagSet("artifact locate", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	dsn := fs.String("postgres", "", "PostgreSQL canonical store DSN")
-	prefix := fs.String("prefix", "", "literal locator URI prefix; %, _ and \\ are not wildcards")
-	if err := fs.Parse(args); err != nil {
-		if err == flag.ErrHelp {
-			return nil
-		}
-		return err
-	}
-	if *dsn == "" {
-		return fmt.Errorf("--postgres is required")
-	}
-	store, err := postgres.Open(*dsn)
-	if err != nil {
-		return err
-	}
-	defer store.Close()
-	locators, err := store.ListLocators(*prefix)
-	if err != nil {
 		return err
 	}
 	return json.NewEncoder(os.Stdout).Encode(struct {
-		Locators []postgres.Locator `json:"locators"`
-	}{Locators: locators})
+		Digest string    `json:"digest"`
+		Size   int64     `json:"size_bytes"`
+		Event  eventJSON `json:"event"`
+	}{
+		Digest: result.Digest,
+		Size:   result.Size,
+		Event:  toEventJSON(result.Event),
+	})
 }
 
-func runKG(args []string) error {
-	fs := flag.NewFlagSet("kg", flag.ContinueOnError)
+const artifactGetUsage = `Usage: duro artifact get --root DIR --sha256 sha256:HEX [--out PATH]
+
+Retrieves the artifact identified by --sha256 from the content-addressed
+filesystem store rooted at --root, streaming and verifying its bytes as
+they are read. Reads directly against the filesystem store; no PostgreSQL
+connection is used or required.
+
+Flags:
+  --root DIR       Content-addressed store root directory (required).
+                    Falls back to DURO_CAS_ROOT.
+  --sha256 IDENT   Required. Artifact identity: sha256:<64 lowercase hex
+                    characters>. Malformed identities are rejected.
+  --out PATH       Optional destination file path. If omitted, bytes are
+                    written to stdout. PATH must not already exist: an
+                    existing destination is never overwritten.
+
+Output:
+  --out given, success: {"digest":"sha256:...","path":"..."} on stdout.
+  --out omitted: the artifact's raw bytes on stdout. A terminal error
+    (corruption, missing artifact, read failure, or interrupted transfer)
+    is always reported with a nonzero exit even if some bytes were already
+    written to stdout -- partial stdout output is never a valid artifact.
+
+Errors (stderr, exit code 1): malformed digest, artifact not found,
+verification failure (streamed bytes do not hash to the requested digest --
+there is no separate size catalog to check against), or --out already
+existing.
+
+Example:
+  duro artifact get --root /var/lib/duro/artifacts \
+    --sha256 sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 \
+    --out ./report.pdf`
+
+func runArtifactGet(args []string) error {
+	fs := flag.NewFlagSet("artifact get", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	dsn := fs.String("postgres", "", "PostgreSQL canonical store DSN")
-	subject := fs.String("subject", "", "subject filter")
-	predicate := fs.String("predicate", "", "predicate filter")
-	object := fs.String("object", "", "object filter")
+	fs.Usage = func() { fmt.Fprintln(os.Stderr, artifactGetUsage) }
+	root := fs.String("root", "", "content-addressed store root directory")
+	digest := fs.String("sha256", "", "artifact identity, sha256:<hex>")
+	out := fs.String("out", "", "destination file path; omit to write to stdout")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *dsn == "" {
-		return fmt.Errorf("--postgres is required")
+	if fs.NArg() > 0 {
+		fs.Usage()
+		return fmt.Errorf("artifact get: unexpected argument(s): %v", fs.Args())
+	}
+	resolvedRoot := casRoot(*root)
+	if resolvedRoot == "" || *digest == "" {
+		fs.Usage()
+		return fmt.Errorf("artifact get: --root (or DURO_CAS_ROOT) and --sha256 are required")
+	}
+	// Validate the digest's shape before cas.Open, which creates directories
+	// under --root as a side effect: a malformed --sha256 should fail
+	// without ever touching the filesystem.
+	if _, err := cas.ParseIdentity(*digest); err != nil {
+		fs.Usage()
+		return err
 	}
 
-	store, err := postgres.Open(*dsn)
+	store, err := cas.Open(resolvedRoot)
 	if err != nil {
 		return err
 	}
-	defer store.Close()
-	projection, err := knowledgegraph.Project(context.Background(), store)
-	if err != nil {
+
+	if *out == "" {
+		if err := artifact.GetToWriter(store, *digest, os.Stdout); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err := artifact.GetToFile(store, *digest, *out); err != nil {
 		return err
 	}
-	return json.NewEncoder(os.Stdout).Encode(projection.Query(*subject, *predicate, *object))
+	return json.NewEncoder(os.Stdout).Encode(struct {
+		Digest string `json:"digest"`
+		Path   string `json:"path"`
+	}{*digest, *out})
 }

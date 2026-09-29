@@ -1,6 +1,9 @@
 services:
-  postgres:
-    image: postgres:16-alpine
+  # PostgreSQL 18 is required: Duro's schema uses the server-side uuidv7()
+  # function added in 18. This service is a fresh deployment -- it never
+  # reuses an older Duro data directory (see README, "Breaking changes").
+  postgres18:
+    image: postgres:18-alpine
     environment:
       POSTGRES_DB: ${DURO_POSTGRES_DB:-duro}
       POSTGRES_USER: ${DURO_POSTGRES_USER:-duro}
@@ -8,7 +11,12 @@ services:
     ports:
       - "${DURO_POSTGRES_BIND:-127.0.0.1}:${DURO_POSTGRES_PORT:-5433}:5432"
     volumes:
-      - ${DURO_POSTGRES_DATA_DIR:-./.duro-postgres-data}:/var/lib/postgresql/data
+      # PostgreSQL 18 images keep the cluster under /var/lib/postgresql/18/docker
+      # and declare the parent directory as the volume, so mount the parent,
+      # not .../data as the 16 images wanted. The default host directory is
+      # deliberately distinct from the PostgreSQL 16 one: pointing this at a
+      # 16 data directory would fail to start, and Duro does not migrate.
+      - ${DURO_POSTGRES_DATA_DIR:-./.duro-postgres18-data}:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 2s

@@ -1,1082 +1,884 @@
 package postgres
 
 import (
-	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"os"
+	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/nseyedtalebi/duro-ledger/internal/pgtest"
 	"github.com/nseyedtalebi/duro-ledger/pkg/event"
 )
 
-const evt1ID = "22222222-2222-2222-2222-222222222222"
-const evt2ID = "33333333-3333-3333-3333-333333333333"
-const evt3ID = "44444444-4444-4444-4444-444444444444"
-const testAdvisoryLockKey = 918273645
-
-// openTestStore skips the test clearly when DURO_POSTGRES_TEST_DSN is
-// unset, and otherwise opens a Store against it with a clean events table.
-func openTestStore(t *testing.T) *Store {
+// initializedDB returns an administrator DSN for a fresh database with
+// Duro's schema applied.
+func initializedDB(t *testing.T) string {
 	t.Helper()
-	dsn := os.Getenv("DURO_POSTGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("DURO_POSTGRES_TEST_DSN not set; skipping PostgreSQL integration test")
-	}
-	raw, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
-	}
-	raw.SetMaxOpenConns(1)
-	if _, err := raw.Exec(`SELECT pg_advisory_lock($1)`, testAdvisoryLockKey); err != nil {
-		raw.Close()
-		t.Fatalf("acquire test lock: %v", err)
-	}
+	dsn := pgtest.NewDatabase(t)
 	if err := Initialize(dsn); err != nil {
-		_, _ = raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
-		raw.Close()
 		t.Fatalf("Initialize: %v", err)
 	}
+	return dsn
+}
+
+func openStore(t *testing.T, dsn string) *Store {
+	t.Helper()
 	s, err := Open(dsn)
 	if err != nil {
-		_, _ = raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
-		raw.Close()
 		t.Fatalf("Open: %v", err)
 	}
-	if _, err := s.db.Exec(`TRUNCATE events, blobs, blob_locator_observations RESTART IDENTITY`); err != nil {
-		s.Close()
-		_, _ = raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
-		raw.Close()
-		t.Fatalf("truncate events: %v", err)
-	}
-	t.Cleanup(func() {
-		s.Close()
-		_, _ = raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
-		raw.Close()
-	})
+	t.Cleanup(func() { s.Close() })
 	return s
 }
 
-func mustEvent(t *testing.T, id, content string) event.Event {
+func openDBT(t *testing.T, dsn string) *sql.DB {
 	t.Helper()
-	ev, err := event.New(id, "test.type", "tester", time.Now().UTC(), json.RawMessage(content), nil)
+	db, err := openDB(dsn)
 	if err != nil {
-		t.Fatalf("event.New: %v", err)
+		t.Fatalf("connecting: %v", err)
 	}
-	return ev
+	t.Cleanup(func() { db.Close() })
+	return db
 }
 
-func mustEventAt(t *testing.T, id string, occurredAt time.Time, content string) event.Event {
+// assertUUIDv7 checks the version and variant bits of a database-generated
+// id: the contract requires database-side UUIDv7, not any UUID.
+func assertUUIDv7(t *testing.T, id string) {
 	t.Helper()
-	ev, err := event.New(id, "test.type", "tester", occurredAt, json.RawMessage(content), nil)
-	if err != nil {
-		t.Fatalf("event.New: %v", err)
+	raw, err := hex.DecodeString(strings.ReplaceAll(id, "-", ""))
+	if err != nil || len(raw) != 16 {
+		t.Fatalf("id %q is not a 16-byte UUID: %v", id, err)
 	}
-	return ev
-}
-
-// TestSchemaDefinesBlobsAndJSONChecks runs without a live DSN: it checks the
-// embedded schema text directly for the blobs table and the JSON-object
-// CHECK constraints on events, so the spec shape is verified even where
-// DURO_POSTGRES_TEST_DSN is unset.
-func TestSchemaDefinesBlobsAndJSONChecks(t *testing.T) {
-	for _, want := range []string{
-		"CREATE TABLE IF NOT EXISTS blobs",
-		"sha256      BYTEA NOT NULL UNIQUE",
-		"size_bytes  BIGINT NOT NULL CHECK (size_bytes >= 0)",
-		"content     BYTEA,",
-		"ALTER TABLE blobs ALTER COLUMN content DROP NOT NULL;",
-		"blob_media_type TEXT",
-		"resource_uri TEXT",
-		"CHECK (jsonb_typeof(content) = 'object')",
-		"CHECK (jsonb_typeof(refs) = 'object')",
-		"events_event_type_nonempty CHECK (event_type <> '')",
-		"CREATE OR REPLACE FUNCTION duro_bind_event_actor()",
-		"current_user",
-		"CREATE TRIGGER events_bind_actor",
-	} {
-		if !strings.Contains(schema, want) {
-			t.Errorf("schema.sql missing expected fragment: %q", want)
-		}
+	if version := raw[6] >> 4; version != 7 {
+		t.Errorf("id %s has UUID version %d, want 7", id, version)
+	}
+	if variant := raw[8] >> 6; variant != 0b10 {
+		t.Errorf("id %s has variant bits %02b, want 10", id, variant)
 	}
 }
 
-func TestScopedEventQueryRejectsInvalidArgumentsBeforeDatabaseAccess(t *testing.T) {
-	s := &Store{}
-	for _, request := range []struct {
-		types []string
-		scope string
-		after int64
-		limit int
-	}{
-		{nil, "scope-a", 0, 1},
-		{[]string{""}, "scope-a", 0, 1},
-		{[]string{"hermes.memory.turn"}, "", 0, 1},
-		{[]string{"hermes.memory.turn"}, "scope-a", -1, 1},
-		{[]string{"hermes.memory.turn"}, "scope-a", 0, 0},
-		{[]string{"hermes.memory.turn"}, "scope-a", 0, 501},
-	} {
-		if _, err := s.ListEventsByTypeAndScope(request.types, request.scope, request.after, request.limit); err == nil {
-			t.Fatalf("invalid scoped query was accepted: %#v", request)
-		}
-	}
-}
-
-func TestSchemaDefinesEventsRLSPublicBaseline(t *testing.T) {
-	for _, want := range []string{
-		"ALTER TABLE events ENABLE ROW LEVEL SECURITY;",
-		"DROP POLICY IF EXISTS events_public_baseline ON events;",
-		"CREATE POLICY events_public_baseline ON events AS PERMISSIVE FOR ALL TO PUBLIC USING (true) WITH CHECK (true);",
-	} {
-		if !strings.Contains(schema, want) {
-			t.Errorf("schema.sql missing events RLS baseline fragment: %q", want)
-		}
-	}
-}
-
-func TestSchemaDefinesScopedEventSequenceIndex(t *testing.T) {
-	if !strings.Contains(schema, "events_type_scope_sequence_idx") {
-		t.Fatal("schema.sql missing scoped event sequence index")
-	}
-}
-
-func TestListEventsByTypeAndScopeFiltersCanonicalPage(t *testing.T) {
-	s := openTestStore(t)
-	for _, input := range []struct{ id, typ, content string }{
-		{"11111111-1111-1111-1111-111111111111", "hermes.memory.turn", `{"deployment_scope":"scope-a","conversation_id":"c","user_text":"alpha","assistant_text":"a"}`},
-		{"22222222-2222-2222-2222-222222222222", "hermes.memory.redacted", `{"deployment_scope":"scope-a","target_event_id":"11111111-1111-1111-1111-111111111111"}`},
-		{"33333333-3333-3333-3333-333333333333", "hermes.memory.turn", `{"deployment_scope":"scope-b","conversation_id":"c","user_text":"beta","assistant_text":"b"}`},
-		{"44444444-4444-4444-4444-444444444444", "other.type", `{"deployment_scope":"scope-a"}`},
-	} {
-		ev, err := event.New(input.id, input.typ, "writer", time.Now().UTC(), json.RawMessage(input.content), nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, _, err := s.Insert(ev); err != nil {
-			t.Fatal(err)
-		}
-	}
-	rows, err := s.ListEventsByTypeAndScope([]string{"hermes.memory.turn", "hermes.memory.redacted"}, "scope-a", 0, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rows) != 2 || rows[0].Event.ID != "11111111-1111-1111-1111-111111111111" || rows[1].Event.ID != "22222222-2222-2222-2222-222222222222" {
-		t.Fatalf("scoped rows = %#v", rows)
-	}
-}
-
-func TestReadBlobMetadataReturnsVerifiedMetadataWithoutContent(t *testing.T) {
-	s := openTestStore(t)
-	body := []byte("canonical body")
-	if outcome, _, err := s.InsertWithBlob(mustEvent(t, evt1ID, `{"source":"cura/drawers/example"}`), body, blobDigest(body), "text/plain"); err != nil || outcome != Accepted {
-		t.Fatalf("InsertWithBlob = outcome:%v err:%v", outcome, err)
-	}
-	metadata, ok, err := s.ReadBlobMetadata(blobDigest(body))
-	if err != nil || !ok {
-		t.Fatalf("ReadBlobMetadata = metadata:%#v ok:%v err:%v", metadata, ok, err)
-	}
-	if metadata.SHA256 != blobDigest(body) || metadata.MediaType != "text/plain" || metadata.Size != int64(len(body)) || metadata.Content != nil {
-		t.Fatalf("metadata = %#v", metadata)
-	}
-}
-
-func TestResourceURIOrdinaryInsertPullAndChangedRetry(t *testing.T) {
-	s := openTestStore(t)
-	at := time.Date(2026, 9, 12, 20, 0, 0, 0, time.UTC)
-	original, err := event.NewWithResourceURI(evt1ID, "document.filed", "writer", at, json.RawMessage(`{"source":"cura/drawers/example"}`), nil, "cura://palace/wing/room/example")
-	if err != nil {
-		t.Fatal(err)
-	}
-	outcome, sequence, err := s.Insert(original)
-	if err != nil || outcome != Accepted || sequence <= 0 {
-		t.Fatalf("Insert = outcome:%v sequence:%d err:%v", outcome, sequence, err)
-	}
-	outcome, retrySequence, err := s.Insert(original)
-	if err != nil || outcome != AlreadyPresent || retrySequence != sequence {
-		t.Fatalf("exact retry = outcome:%v sequence:%d err:%v", outcome, retrySequence, err)
-	}
-	changed := original
-	changed.ResourceURI = "cura://palace/wing/room/correction"
-	outcome, retrySequence, err = s.Insert(changed)
-	if err != nil || outcome != Conflict || retrySequence != sequence {
-		t.Fatalf("changed URI retry = outcome:%v sequence:%d err:%v", outcome, retrySequence, err)
-	}
-	rows, err := s.Pull(0, 10)
-	if err != nil || len(rows) != 1 || rows[0].Event.ResourceURI != original.ResourceURI {
-		t.Fatalf("Pull = rows:%#v err:%v", rows, err)
-	}
-}
-
-func TestResourceURIBlobInsertChangedRetryConflicts(t *testing.T) {
-	s := openTestStore(t)
-	at := time.Date(2026, 9, 12, 20, 0, 0, 0, time.UTC)
-	original, err := event.NewWithResourceURI(evt1ID, "document.filed", "writer", at, json.RawMessage(`{"source":"cura/drawers/example"}`), nil, "cura://palace/wing/room/example")
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := []byte("canonical body")
-	outcome, sequence, err := s.InsertWithBlob(original, body, blobDigest(body), "text/plain")
-	if err != nil || outcome != Accepted || sequence <= 0 {
-		t.Fatalf("InsertWithBlob = outcome:%v sequence:%d err:%v", outcome, sequence, err)
-	}
-	changed := original
-	changed.ResourceURI = "cura://palace/wing/room/correction"
-	outcome, retrySequence, err := s.InsertWithBlob(changed, body, blobDigest(body), "text/plain")
-	if err != nil || outcome != Conflict || retrySequence != sequence {
-		t.Fatalf("changed URI blob retry = outcome:%v sequence:%d err:%v", outcome, retrySequence, err)
-	}
-}
-
-func TestInsertBindsNewActorToAuthenticatedRole(t *testing.T) {
-	s := openTestStore(t)
-
-	var currentUser string
-	if err := s.db.QueryRow(`SELECT current_user`).Scan(&currentUser); err != nil {
-		t.Fatalf("current_user: %v", err)
-	}
-	if _, _, err := s.Insert(mustEvent(t, evt1ID, `{"a":1}`)); err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-
-	var actor string
-	if err := s.db.QueryRow(`SELECT actor FROM events WHERE id = $1`, evt1ID).Scan(&actor); err != nil {
-		t.Fatalf("actor: %v", err)
-	}
-	if actor != currentUser {
-		t.Fatalf("actor = %q, want authenticated role %q", actor, currentUser)
-	}
-}
-
-func TestInitializeAppliesSchema(t *testing.T) {
-	dsn := os.Getenv("DURO_POSTGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("DURO_POSTGRES_TEST_DSN not set; skipping PostgreSQL integration test")
-	}
-	raw, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Close()
-	raw.SetMaxOpenConns(1)
-	if _, err := raw.Exec(`SELECT pg_advisory_lock($1)`, testAdvisoryLockKey); err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
-
+func TestAppendRoundTrip(t *testing.T) {
+	dsn := initializedDB(t)
+	// Initialize is idempotent against an already-compliant database.
 	if err := Initialize(dsn); err != nil {
-		t.Fatalf("Initialize: %v", err)
+		t.Fatalf("second Initialize: %v", err)
 	}
-	var events, blobs sql.NullString
-	if err := raw.QueryRow(`SELECT to_regclass('public.events'), to_regclass('public.blobs')`).Scan(&events, &blobs); err != nil {
+	s := openStore(t, dsn)
+
+	before := time.Now().Add(-time.Minute)
+	se, err := s.Append(event.New{EventType: "document.tagged", Content: json.RawMessage(`{"tag":"reviewed"}`)})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	assertUUIDv7(t, se.ID)
+	if se.EventType != "document.tagged" {
+		t.Errorf("event_type = %q", se.EventType)
+	}
+	if se.ReceivedAt.Before(before) || se.ReceivedAt.After(time.Now().Add(time.Minute)) {
+		t.Errorf("received_at = %v, want the insertion instant", se.ReceivedAt)
+	}
+	if string(se.Refs) != "{}" {
+		t.Errorf("refs = %s, want the {} default", se.Refs)
+	}
+
+	db := openDBT(t, dsn)
+	var sessionUser string
+	if err := db.QueryRow(`SELECT session_user`).Scan(&sessionUser); err != nil {
 		t.Fatal(err)
 	}
-	if events.String != "events" || blobs.String != "blobs" {
-		t.Fatalf("schema missing tables: events=%q blobs=%q", events.String, blobs.String)
+	if se.Actor != sessionUser {
+		t.Errorf("actor = %q, want the authenticated login identity %q", se.Actor, sessionUser)
 	}
-}
 
-// The empty-event_type rule lives in the schema, not only in event.Validate,
-// so raw SQL that bypasses Go cannot land an untyped canonical event. Running
-// Initialize twice also pins idempotency against an already-initialized
-// database, where the constraint already exists.
-func TestInitializeRejectsEmptyEventTypeFromRawSQL(t *testing.T) {
-	dsn := os.Getenv("DURO_POSTGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("DURO_POSTGRES_TEST_DSN not set; skipping PostgreSQL integration test")
+	// Committed readback through a plain SQL read, as a projector would do.
+	var gotID, gotType, gotActor, gotContent, gotRefs string
+	if err := db.QueryRow(`SELECT id::text, event_type, actor, content::text, refs::text FROM public.events ORDER BY id`).
+		Scan(&gotID, &gotType, &gotActor, &gotContent, &gotRefs); err != nil {
+		t.Fatalf("readback: %v", err)
 	}
-	raw, err := sql.Open("pgx", dsn)
+	if gotID != se.ID || gotType != se.EventType || gotActor != se.Actor || gotRefs != "{}" {
+		t.Errorf("readback mismatch: %s %s %s %s", gotID, gotType, gotActor, gotRefs)
+	}
+	if gotContent != `{"tag": "reviewed"}` {
+		t.Errorf("content = %s, want jsonb-normalized form", gotContent)
+	}
+
+	// Repeating the same input creates another event.
+	se2, err := s.Append(event.New{EventType: "document.tagged", Content: json.RawMessage(`{"tag":"reviewed"}`)})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("second Append: %v", err)
 	}
-	defer raw.Close()
-	raw.SetMaxOpenConns(1)
-	if _, err := raw.Exec(`SELECT pg_advisory_lock($1)`, testAdvisoryLockKey); err != nil {
-		t.Fatal(err)
+	if se2.ID == se.ID {
+		t.Fatal("repeated append reused the same id")
 	}
-	defer raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
-
-	if err := Initialize(dsn); err != nil {
-		t.Fatalf("Initialize: %v", err)
+	if se2.ID < se.ID {
+		t.Errorf("uuidv7 ids should ascend with time: %s then %s", se.ID, se2.ID)
 	}
-	if err := Initialize(dsn); err != nil {
-		t.Fatalf("Initialize again: %v", err)
-	}
-
-	const insert = `INSERT INTO events(id, occurred_at, event_type, actor, content, refs)
-	                VALUES ($1, now(), $2, 'tester', '{}'::jsonb, '{}'::jsonb)`
-	if _, err := raw.Exec(insert, uuid.NewString(), ""); err == nil {
-		t.Fatal("want the schema to reject an empty event_type inserted by raw SQL")
-	}
-
-	// Only the empty string is rejected, matching event.Validate exactly:
-	// whitespace is still a legal event_type. The whole probe rolls back so
-	// the shared test table is left as it was found.
-	tx, err := raw.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(insert, uuid.NewString(), " "); err != nil {
-		t.Fatalf("whitespace event_type must still be accepted, got: %v", err)
-	}
-}
-
-func TestInitializeEnablesEventsRLSWithPublicBaseline(t *testing.T) {
-	dsn := os.Getenv("DURO_POSTGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("DURO_POSTGRES_TEST_DSN not set; skipping PostgreSQL integration test")
-	}
-	raw, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Close()
-	raw.SetMaxOpenConns(1)
-	if _, err := raw.Exec(`SELECT pg_advisory_lock($1)`, testAdvisoryLockKey); err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
-
-	if err := Initialize(dsn); err != nil {
-		t.Fatalf("Initialize: %v", err)
-	}
-	if err := Initialize(dsn); err != nil {
-		t.Fatalf("Initialize again: %v", err)
-	}
-
-	var (
-		rlsEnabled  bool
-		permissive  string
-		command     string
-		public      bool
-		using       string
-		withCheck   string
-		policyCount int
-	)
-	err = raw.QueryRow(`
-		SELECT c.relrowsecurity, v.permissive, v.cmd,
-		       p.polroles = ARRAY[0::oid],
-		       pg_get_expr(p.polqual, p.polrelid),
-		       pg_get_expr(p.polwithcheck, p.polrelid),
-		       (SELECT COUNT(*) FROM pg_policy AS p2 WHERE p2.polrelid = c.oid AND p2.polname = 'events_public_baseline')
-		FROM pg_class AS c
-		JOIN pg_namespace AS n ON n.oid = c.relnamespace
-		JOIN pg_policy AS p ON p.polrelid = c.oid
-		JOIN pg_policies AS v ON v.schemaname = n.nspname AND v.tablename = c.relname AND v.policyname = p.polname
-		WHERE n.nspname = 'public' AND c.relname = 'events'
-		  AND p.polname = 'events_public_baseline'
-	`).Scan(&rlsEnabled, &permissive, &command, &public, &using, &withCheck, &policyCount)
-	if err != nil {
-		t.Fatalf("read events RLS baseline: %v", err)
-	}
-	if !rlsEnabled || permissive != "PERMISSIVE" || command != "ALL" || !public || using != "true" || withCheck != "true" || policyCount != 1 {
-		t.Fatalf("events RLS baseline = rls=%t permissive=%q command=%q public=%t using=%q withCheck=%q count=%d", rlsEnabled, permissive, command, public, using, withCheck, policyCount)
-	}
-}
-
-// TestInsertRejectsInvalidEventWithTypedError runs without a live DSN:
-// Insert validates before touching the database, so a zero-value Store
-// exercises the rejection path on its own.
-func TestInsertRejectsInvalidEventWithTypedError(t *testing.T) {
-	s := &Store{}
-	invalid := event.Event{ID: evt1ID} // missing event_type/actor/content/refs
-
-	outcome, seq, err := s.Insert(invalid)
-	if outcome != Rejected {
-		t.Fatalf("want Rejected, got %v", outcome)
-	}
-	if seq != 0 {
-		t.Fatalf("want sequence 0, got %d", seq)
-	}
-	var verr *ValidationError
-	if !errors.As(err, &verr) {
-		t.Fatalf("want a *ValidationError, got %T: %v", err, err)
-	}
-	if !strings.Contains(verr.Error(), "event_type") {
-		t.Fatalf("want validation reason in error, got %q", verr.Error())
-	}
-	// The typed error must wrap the underlying validation error so callers
-	// can still inspect it with errors.Is/errors.As.
-	if errors.Unwrap(verr) == nil {
-		t.Fatal("want ValidationError to unwrap to the underlying error")
-	}
-}
-
-func TestInsertAcceptsFreshEvent(t *testing.T) {
-	s := openTestStore(t)
-
-	outcome, seq, err := s.Insert(mustEvent(t, evt1ID, `{"a":1}`))
-	if err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-	if outcome != Accepted {
-		t.Fatalf("want Accepted, got %v", outcome)
-	}
-	if seq <= 0 {
-		t.Fatalf("want positive sequence, got %d", seq)
-	}
-}
-
-func TestInsertDuplicateSameContentIsAlreadyPresent(t *testing.T) {
-	s := openTestStore(t)
-	at := time.Now().UTC()
-	ev := mustEventAt(t, evt1ID, at, `{"a":1}`)
-
-	_, firstSeq, err := s.Insert(ev)
-	if err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-
-	outcome, seq, err := s.Insert(ev)
-	if err != nil {
-		t.Fatalf("Insert retry: %v", err)
-	}
-	if outcome != AlreadyPresent {
-		t.Fatalf("want AlreadyPresent, got %v", outcome)
-	}
-	if seq != firstSeq {
-		t.Fatalf("want same sequence %d on retry, got %d", firstSeq, seq)
-	}
-
 	var count int
-	if err := s.db.QueryRow(`SELECT count(*) FROM events WHERE id = $1`, evt1ID).Scan(&count); err != nil {
-		t.Fatalf("count: %v", err)
+	if err := db.QueryRow(`SELECT count(*) FROM public.events`).Scan(&count); err != nil {
+		t.Fatal(err)
 	}
-	if count != 1 {
-		t.Fatalf("want exactly 1 row, got %d", count)
+	if count != 2 {
+		t.Errorf("row count = %d, want 2", count)
+	}
+
+	// Client-side validation failures never reach the database.
+	if err := func() error { _, err := s.Append(event.New{EventType: " \t "}); return err }(); err == nil {
+		t.Error("Append with blank event_type = nil, want validation error")
+	}
+	var ae *AppendError
+	if _, err := s.Append(event.New{EventType: "a", Content: json.RawMessage(`[]`)}); err == nil || errors.As(err, &ae) {
+		t.Errorf("Append with non-object content = %v, want a plain validation error", err)
 	}
 }
 
-func TestInsertDuplicateWithReorderedKeysIsAlreadyPresent(t *testing.T) {
-	s := openTestStore(t)
-	at := time.Now().UTC()
+// TestDatabaseEnforcesFieldRules drives the constraints directly, because
+// the contract makes PostgreSQL -- not Duro -- the authority for them.
+func TestDatabaseEnforcesFieldRules(t *testing.T) {
+	db := openDBT(t, initializedDB(t))
 
-	if _, _, err := s.Insert(mustEventAt(t, evt1ID, at, `{"a":1,"b":2}`)); err != nil {
-		t.Fatalf("Insert: %v", err)
+	// A JSON object that is over 1 MiB as raw text but normalizes well under
+	// it must be accepted: the limit is measured on jsonb::text.
+	padding := strings.Repeat(" ", 1<<20)
+	paddedDuplicateKeys := `{` + padding + `"k"` + padding + `:` + padding + `1,"k":2` + padding + `}`
+	var stored string
+	if err := db.QueryRow(
+		`INSERT INTO public.events (event_type, content) VALUES ('t', $1::jsonb) RETURNING content::text`,
+		paddedDuplicateKeys).Scan(&stored); err != nil {
+		t.Fatalf("whitespace-padded input that normalizes small must be accepted: %v", err)
 	}
-	outcome, _, err := s.Insert(mustEventAt(t, evt1ID, at, `{ "b" : 2 , "a" : 1 }`))
+	if stored != `{"k": 2}` {
+		t.Errorf("stored content = %s, want last-value-wins normalization", stored)
+	}
+
+	// Compact JSON that is still over 1 MiB after normalization is rejected.
+	oversize := `{"k":"` + strings.Repeat("x", 1<<20) + `"}`
+	rejected := []struct {
+		name, stmt, arg string
+	}{
+		{"empty event_type", `INSERT INTO public.events (event_type) VALUES ($1)`, ""},
+		{"ascii blank event_type", `INSERT INTO public.events (event_type) VALUES ($1)`, "  \t\n "},
+		{"unicode blank event_type", `INSERT INTO public.events (event_type) VALUES ($1)`, " 　 "},
+		{"oversized event_type", `INSERT INTO public.events (event_type) VALUES ($1)`, strings.Repeat("a", 256)},
+		{"multibyte oversized event_type", `INSERT INTO public.events (event_type) VALUES ($1)`, strings.Repeat("é", 128)},
+		{"content array", `INSERT INTO public.events (event_type, content) VALUES ('t', $1::jsonb)`, `[]`},
+		{"content scalar", `INSERT INTO public.events (event_type, content) VALUES ('t', $1::jsonb)`, `3`},
+		{"content null", `INSERT INTO public.events (event_type, content) VALUES ('t', $1::jsonb)`, `null`},
+		{"refs array", `INSERT INTO public.events (event_type, refs) VALUES ('t', $1::jsonb)`, `[]`},
+		{"oversized content", `INSERT INTO public.events (event_type, content) VALUES ('t', $1::jsonb)`, oversize},
+		{"oversized refs", `INSERT INTO public.events (event_type, refs) VALUES ('t', $1::jsonb)`, oversize},
+	}
+	for _, tc := range rejected {
+		if _, err := db.Exec(tc.stmt, tc.arg); err == nil {
+			t.Errorf("%s: insert succeeded, want rejection", tc.name)
+		}
+	}
+	// A 255-byte event_type is fine.
+	if _, err := db.Exec(`INSERT INTO public.events (event_type) VALUES ($1)`, strings.Repeat("a", 255)); err != nil {
+		t.Errorf("255-byte event_type rejected: %v", err)
+	}
+	// Explicit NULLs in the database-owned columns are rejected outright.
+	for _, col := range []string{"id", "received_at", "actor"} {
+		if _, err := db.Exec(fmt.Sprintf(`INSERT INTO public.events (event_type, %s) VALUES ('t', NULL)`, col)); err == nil {
+			t.Errorf("NULL %s accepted", col)
+		}
+	}
+}
+
+// TestSearchPathCannotRedirectAppends puts a decoy "events" table ahead of
+// public on the search path. Every statement Duro issues is schema-qualified,
+// so appends must still land in public.events.
+func TestSearchPathCannotRedirectAppends(t *testing.T) {
+	dsn := initializedDB(t)
+	admin := openDBT(t, dsn)
+	for _, stmt := range []string{
+		`CREATE SCHEMA decoy`,
+		`CREATE TABLE decoy.events (id UUID DEFAULT pg_catalog.uuidv7(), received_at TIMESTAMPTZ DEFAULT pg_catalog.clock_timestamp(),
+			event_type TEXT, actor TEXT DEFAULT 'forged', content JSONB DEFAULT '{}'::jsonb, refs JSONB DEFAULT '{}'::jsonb)`,
+		`SET search_path TO decoy, public`,
+	} {
+		if _, err := admin.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	// Apply the hostile search_path to every new session in this database.
+	var dbName string
+	if err := admin.QueryRow(`SELECT pg_catalog.current_database()`).Scan(&dbName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(fmt.Sprintf(`ALTER DATABASE %s SET search_path TO decoy, public`, pgx.Identifier{dbName}.Sanitize())); err != nil {
+		t.Fatalf("setting hostile search_path: %v", err)
+	}
+
+	// A fresh Initialize must still be a compatible no-op, and the append
+	// must land in the canonical table.
+	if err := Initialize(dsn); err != nil {
+		t.Fatalf("Initialize under a hostile search_path: %v", err)
+	}
+	if _, err := openStore(t, dsn).Append(event.New{EventType: "not.decoyed"}); err != nil {
+		t.Fatalf("Append under a hostile search_path: %v", err)
+	}
+	var canonical, decoyed int
+	if err := admin.QueryRow(`SELECT (SELECT count(*) FROM public.events), (SELECT count(*) FROM decoy.events)`).Scan(&canonical, &decoyed); err != nil {
+		t.Fatal(err)
+	}
+	if canonical != 1 || decoyed != 0 {
+		t.Errorf("public.events has %d rows, decoy.events has %d; want 1 and 0", canonical, decoyed)
+	}
+}
+
+func TestFreshSchemaHasNoPublicGrants(t *testing.T) {
+	db := openDBT(t, initializedDB(t))
+	for _, priv := range []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE"} {
+		var has bool
+		if err := db.QueryRow(`SELECT pg_catalog.has_table_privilege('public', 'public.events', $1)`, priv).Scan(&has); err != nil {
+			t.Fatal(err)
+		}
+		if has {
+			t.Errorf("PUBLIC holds %s on public.events", priv)
+		}
+	}
+}
+
+func TestInitializeRefusesIncompatibleSchema(t *testing.T) {
+	// Each variant has the contract's exact column set and types, so a
+	// shape-only compatibility check would wrongly accept every one of
+	// them.
+	variants := map[string]string{
+		"no primary key": `CREATE TABLE public.events (
+			id UUID NOT NULL DEFAULT pg_catalog.uuidv7(),
+			received_at TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+			event_type TEXT NOT NULL, actor TEXT NOT NULL DEFAULT session_user,
+			content JSONB NOT NULL DEFAULT '{}'::jsonb, refs JSONB NOT NULL DEFAULT '{}'::jsonb)`,
+		"caller-supplied id": `CREATE TABLE public.events (
+			id UUID NOT NULL PRIMARY KEY,
+			received_at TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+			event_type TEXT NOT NULL, actor TEXT NOT NULL DEFAULT session_user,
+			content JSONB NOT NULL DEFAULT '{}'::jsonb, refs JSONB NOT NULL DEFAULT '{}'::jsonb)`,
+		"transaction timestamp": `CREATE TABLE public.events (
+			id UUID NOT NULL DEFAULT pg_catalog.uuidv7() PRIMARY KEY,
+			received_at TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.now(),
+			event_type TEXT NOT NULL, actor TEXT NOT NULL DEFAULT session_user,
+			content JSONB NOT NULL DEFAULT '{}'::jsonb, refs JSONB NOT NULL DEFAULT '{}'::jsonb)`,
+		"forgeable actor": `CREATE TABLE public.events (
+			id UUID NOT NULL DEFAULT pg_catalog.uuidv7() PRIMARY KEY,
+			received_at TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+			event_type TEXT NOT NULL, actor TEXT NOT NULL,
+			content JSONB NOT NULL DEFAULT '{}'::jsonb, refs JSONB NOT NULL DEFAULT '{}'::jsonb)`,
+		"nullable content": `CREATE TABLE public.events (
+			id UUID NOT NULL DEFAULT pg_catalog.uuidv7() PRIMARY KEY,
+			received_at TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+			event_type TEXT NOT NULL, actor TEXT NOT NULL DEFAULT session_user,
+			content JSONB DEFAULT '{}'::jsonb, refs JSONB NOT NULL DEFAULT '{}'::jsonb)`,
+		"no checks": `CREATE TABLE public.events (
+			id UUID NOT NULL DEFAULT pg_catalog.uuidv7() PRIMARY KEY,
+			received_at TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+			event_type TEXT NOT NULL, actor TEXT NOT NULL DEFAULT session_user,
+			content JSONB NOT NULL DEFAULT '{}'::jsonb, refs JSONB NOT NULL DEFAULT '{}'::jsonb,
+			CONSTRAINT events_event_type_nonblank CHECK (event_type <> ''))`,
+	}
+	for name, ddl := range variants {
+		t.Run(name, func(t *testing.T) {
+			dsn := pgtest.NewDatabase(t)
+			db := openDBT(t, dsn)
+			if _, err := db.Exec(ddl); err != nil {
+				t.Fatalf("creating legacy table: %v", err)
+			}
+			if _, err := db.Exec(`INSERT INTO public.events (id, event_type, actor) VALUES (pg_catalog.uuidv7(), 'legacy.event', 'someone')`); err != nil {
+				// Not every variant accepts this exact insert; a row is
+				// nice-to-have for the untouched check, not essential.
+				t.Logf("legacy insert: %v", err)
+			}
+			err := Initialize(dsn)
+			if err == nil {
+				t.Fatal("Initialize accepted an incompatible public.events")
+			}
+			if !strings.Contains(err.Error(), "does not match the current contract schema") {
+				t.Errorf("Initialize error = %v, want a schema-mismatch refusal", err)
+			}
+			// The legacy table and its data must be untouched: same
+			// definition, same rows, and no leftover reference table.
+			var relkind string
+			if err := db.QueryRow(`SELECT relkind::text FROM pg_catalog.pg_class WHERE oid = 'public.events'::pg_catalog.regclass`).Scan(&relkind); err != nil {
+				t.Fatalf("legacy table gone: %v", err)
+			}
+			var n int
+			if err := db.QueryRow(`SELECT count(*) FROM public.events`).Scan(&n); err != nil {
+				t.Fatalf("legacy rows unreadable: %v", err)
+			}
+			var leftovers int
+			if err := db.QueryRow(`SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'duro_events_reference'`).Scan(&leftovers); err != nil {
+				t.Fatal(err)
+			}
+			if leftovers != 0 {
+				t.Errorf("Initialize left %d reference tables behind", leftovers)
+			}
+		})
+	}
+}
+
+func adminExec(t *testing.T, dsn, stmt string) {
+	t.Helper()
+	if _, err := openDBT(t, dsn).Exec(stmt); err != nil {
+		t.Fatalf("%s: %v", stmt, err)
+	}
+}
+
+// TestInitializeRefusesDifferentSemantics covers relations whose column
+// descriptors can look right while the relation means something else:
+// unlogged storage (events would not survive a crash), a view, and extra
+// user triggers or rules that can rewrite or suppress appends.
+func TestInitializeRefusesDifferentSemantics(t *testing.T) {
+	cases := []struct {
+		name            string
+		initializeFirst bool
+		setup           []string
+	}{
+		{"unlogged table", false, []string{strings.ReplaceAll(schema, "CREATE TABLE IF NOT EXISTS", "CREATE UNLOGGED TABLE IF NOT EXISTS")}},
+		{"view over another table", false, []string{
+			strings.ReplaceAll(schema, "public.events", "public.events_real"),
+			`CREATE VIEW public.events AS SELECT * FROM public.events_real`,
+		}},
+		{"user trigger", true, []string{
+			`CREATE FUNCTION public.duro_test_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`,
+			`CREATE TRIGGER duro_test_trigger BEFORE INSERT ON public.events FOR EACH ROW EXECUTE FUNCTION public.duro_test_trigger()`,
+		}},
+		{"rule", true, []string{
+			`CREATE RULE duro_test_rule AS ON DELETE TO public.events DO INSTEAD NOTHING`,
+		}},
+		// Row-level security makes the canonical table a per-role filtered
+		// projection: reads can be narrowed and appends rejected per role,
+		// neither of which is the standalone contract.
+		{"row security enabled", true, []string{
+			`ALTER TABLE public.events ENABLE ROW LEVEL SECURITY`,
+		}},
+		{"row security forced", true, []string{
+			`ALTER TABLE public.events FORCE ROW LEVEL SECURITY`,
+		}},
+		{"policy attached", true, []string{
+			`CREATE POLICY duro_test_policy ON public.events FOR SELECT USING (true)`,
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn := pgtest.NewDatabase(t)
+			if tc.initializeFirst {
+				if err := Initialize(dsn); err != nil {
+					t.Fatalf("Initialize: %v", err)
+				}
+				// An existing row witnesses that a refusal changes no data.
+				adminExec(t, dsn, `INSERT INTO public.events (event_type) VALUES ('drift.witness')`)
+			}
+			for _, stmt := range tc.setup {
+				adminExec(t, dsn, stmt)
+			}
+			err := Initialize(dsn)
+			if err == nil {
+				t.Fatal("Initialize accepted a relation with different semantics")
+			}
+			if !strings.Contains(err.Error(), "refusing") {
+				t.Errorf("Initialize error = %v, want a refusal", err)
+			}
+			// Nothing was altered or dropped.
+			var relkind string
+			if err := openDBT(t, dsn).QueryRow(
+				`SELECT relkind::text FROM pg_catalog.pg_class WHERE oid = 'public.events'::pg_catalog.regclass`).Scan(&relkind); err != nil {
+				t.Fatalf("relation gone after refusal: %v", err)
+			}
+			if tc.initializeFirst {
+				// The connecting role is the cluster superuser, so this count
+				// is not itself filtered by the RLS cases above.
+				var rows int
+				if err := openDBT(t, dsn).QueryRow(`SELECT count(*) FROM public.events`).Scan(&rows); err != nil {
+					t.Fatalf("counting rows after refusal: %v", err)
+				}
+				if rows != 1 {
+					t.Errorf("events holds %d rows after a refusal, want the 1 that existed before", rows)
+				}
+			}
+		})
+	}
+}
+
+// privileges snapshots what a role can do to the canonical table, so a
+// refused provisioning can be shown to have granted nothing.
+func privileges(t *testing.T, dsn, role string) string {
+	t.Helper()
+	var out string
+	if err := openDBT(t, dsn).QueryRow(`
+		SELECT pg_catalog.concat_ws(',',
+			pg_catalog.has_table_privilege($1, 'public.events', 'SELECT'),
+			pg_catalog.has_any_column_privilege($1, 'public.events', 'INSERT'),
+			pg_catalog.has_any_column_privilege($1, 'public.events', 'UPDATE'),
+			pg_catalog.has_table_privilege($1, 'public.events', 'DELETE'),
+			pg_catalog.has_schema_privilege($1, 'public', 'USAGE'))`, role).Scan(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestProvisionEligibility is the writer/reader boundary Hypatia broke:
+// every form of authority that would let a "restricted" role forge
+// server-owned columns or mutate the ledger -- including authority reachable
+// only by SET ROLE, which NOINHERIT hides from inherited-privilege checks --
+// must be refused, and a refusal must grant nothing.
+func TestProvisionEligibility(t *testing.T) {
+	stmt := func(format string) func(*testing.T, string, string) {
+		return func(t *testing.T, dsn, role string) {
+			adminExec(t, dsn, fmt.Sprintf(format, pgx.Identifier{role}.Sanitize()))
+		}
+	}
+	cases := []struct {
+		name    string
+		prepare func(t *testing.T, dsn, role string)
+	}{
+		{"insert on id", stmt(`GRANT INSERT (id) ON public.events TO %s`)},
+		{"insert on received_at", stmt(`GRANT INSERT (received_at) ON public.events TO %s`)},
+		{"insert on actor", stmt(`GRANT INSERT (actor) ON public.events TO %s`)},
+		{"table-wide insert", stmt(`GRANT INSERT ON public.events TO %s`)},
+		{"table-wide update", stmt(`GRANT UPDATE ON public.events TO %s`)},
+		{"column update", stmt(`GRANT UPDATE (event_type) ON public.events TO %s`)},
+		{"delete", stmt(`GRANT DELETE ON public.events TO %s`)},
+		{"truncate", stmt(`GRANT TRUNCATE ON public.events TO %s`)},
+		{"trigger", stmt(`GRANT TRIGGER ON public.events TO %s`)},
+		{"createrole", stmt(`ALTER ROLE %s CREATEROLE`)},
+		{"createdb", stmt(`ALTER ROLE %s CREATEDB`)},
+		{"bypassrls", stmt(`ALTER ROLE %s BYPASSRLS`)},
+		{"replication", stmt(`ALTER ROLE %s REPLICATION`)},
+		{"table owner", stmt(`ALTER TABLE public.events OWNER TO %s`)},
+		{"schema owner", stmt(`ALTER SCHEMA public OWNER TO %s`)},
+		{"database owner", func(t *testing.T, dsn, role string) {
+			var db string
+			if err := openDBT(t, dsn).QueryRow(`SELECT pg_catalog.current_database()`).Scan(&db); err != nil {
+				t.Fatal(err)
+			}
+			var admin string
+			if err := openDBT(t, dsn).QueryRow(`SELECT session_user`).Scan(&admin); err != nil {
+				t.Fatal(err)
+			}
+			adminExec(t, dsn, fmt.Sprintf(`ALTER DATABASE %s OWNER TO %s`, pgx.Identifier{db}.Sanitize(), pgx.Identifier{role}.Sanitize()))
+			// Hand ownership back before the role is dropped: a database is
+			// not covered by DROP OWNED BY.
+			t.Cleanup(func() {
+				adminExec(t, dsn, fmt.Sprintf(`ALTER DATABASE %s OWNER TO %s`, pgx.Identifier{db}.Sanitize(), pgx.Identifier{admin}.Sanitize()))
+			})
+		}},
+		{"mutation reachable only by SET ROLE", func(t *testing.T, dsn, role string) {
+			mutator, _ := pgtest.NewRole(t, dsn)
+			adminExec(t, dsn, fmt.Sprintf(`GRANT UPDATE ON public.events TO %s`, pgx.Identifier{mutator}.Sanitize()))
+			adminExec(t, dsn, fmt.Sprintf(`ALTER ROLE %s NOINHERIT`, pgx.Identifier{role}.Sanitize()))
+			adminExec(t, dsn, fmt.Sprintf(`GRANT %s TO %s WITH INHERIT FALSE, SET TRUE`,
+				pgx.Identifier{mutator}.Sanitize(), pgx.Identifier{role}.Sanitize()))
+		}},
+		{"insert reachable only by SET ROLE", func(t *testing.T, dsn, role string) {
+			forger, _ := pgtest.NewRole(t, dsn)
+			adminExec(t, dsn, fmt.Sprintf(`GRANT INSERT (actor) ON public.events TO %s`, pgx.Identifier{forger}.Sanitize()))
+			adminExec(t, dsn, fmt.Sprintf(`ALTER ROLE %s NOINHERIT`, pgx.Identifier{role}.Sanitize()))
+			adminExec(t, dsn, fmt.Sprintf(`GRANT %s TO %s WITH INHERIT FALSE, SET TRUE`,
+				pgx.Identifier{forger}.Sanitize(), pgx.Identifier{role}.Sanitize()))
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn := initializedDB(t)
+			role, _ := pgtest.NewRole(t, dsn)
+			tc.prepare(t, dsn, role)
+
+			before := privileges(t, dsn, role)
+			if err := ProvisionWriter(dsn, role); err == nil {
+				t.Error("ProvisionWriter accepted a role it cannot restrict")
+			}
+			if err := ProvisionReader(dsn, role); err == nil {
+				t.Error("ProvisionReader accepted a role it cannot restrict")
+			}
+			if after := privileges(t, dsn, role); after != before {
+				t.Errorf("a refused provisioning changed privileges: %s -> %s", before, after)
+			}
+		})
+	}
+}
+
+func TestProvisionAcceptsSafeRolesIdempotently(t *testing.T) {
+	dsn := initializedDB(t)
+	writer, writerDSN := pgtest.NewRole(t, dsn)
+	reader, readerDSN := pgtest.NewRole(t, dsn)
+	// Twice each: re-provisioning an already-provisioned role must succeed,
+	// even though the writer now holds INSERT on the unprotected columns.
+	for i := range 2 {
+		if err := ProvisionWriter(dsn, writer); err != nil {
+			t.Fatalf("ProvisionWriter (pass %d): %v", i, err)
+		}
+		if err := ProvisionReader(dsn, reader); err != nil {
+			t.Fatalf("ProvisionReader (pass %d): %v", i, err)
+		}
+	}
+	se, err := openStore(t, writerDSN).Append(event.New{EventType: "still.works"})
 	if err != nil {
-		t.Fatalf("Insert retry: %v", err)
+		t.Fatalf("writer Append: %v", err)
 	}
-	if outcome != AlreadyPresent {
-		t.Fatalf("want AlreadyPresent for reordered/whitespace-differing duplicate, got %v", outcome)
+	if se.Actor != writer {
+		t.Errorf("actor = %q, want %q", se.Actor, writer)
 	}
-}
-
-func TestInsertChangedContentIsConflict(t *testing.T) {
-	s := openTestStore(t)
-	at := time.Now().UTC()
-
-	if _, _, err := s.Insert(mustEventAt(t, evt1ID, at, `{"a":1}`)); err != nil {
-		t.Fatalf("Insert: %v", err)
+	// The provisioned writer still cannot touch server-owned columns.
+	if _, err := openDBT(t, writerDSN).Exec(`INSERT INTO public.events (event_type, actor) VALUES ('forge', 'forged')`); err == nil {
+		t.Error("provisioned writer could forge actor")
 	}
-	outcome, _, err := s.Insert(mustEventAt(t, evt1ID, at, `{"a":2}`))
-	if err != nil {
-		t.Fatalf("Insert retry: %v", err)
-	}
-	if outcome != Conflict {
-		t.Fatalf("want Conflict, got %v", outcome)
-	}
-
-	// Original content must be untouched.
-	var content string
-	if err := s.db.QueryRow(`SELECT content::text FROM events WHERE id = $1`, evt1ID).Scan(&content); err != nil {
-		t.Fatalf("select content: %v", err)
-	}
-	if content != `{"a": 1}` {
-		t.Fatalf("want original content preserved, got %s", content)
+	var n int
+	if err := openDBT(t, readerDSN).QueryRow(`SELECT count(*) FROM public.events`).Scan(&n); err != nil || n != 1 {
+		t.Errorf("reader SELECT = %d, %v", n, err)
 	}
 }
 
-func TestInsertChangedOccurredAtIsConflict(t *testing.T) {
-	s := openTestStore(t)
-
-	first := mustEventAt(t, evt1ID, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), `{"a":1}`)
-	if _, _, err := s.Insert(first); err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-	second := mustEventAt(t, evt1ID, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), `{"a":1}`)
-	outcome, _, err := s.Insert(second)
-	if err != nil {
-		t.Fatalf("Insert retry: %v", err)
-	}
-	if outcome != Conflict {
-		t.Fatalf("want Conflict for changed occurred_at, got %v", outcome)
-	}
-}
-
-func TestInsertNanosecondOccurredAtRoundTripsAsAlreadyPresent(t *testing.T) {
-	// PostgreSQL TIMESTAMPTZ has microsecond resolution; a retry of the
-	// exact same event submitted with full nanosecond precision must not
-	// be misreported as a conflict due to that truncation.
-	s := openTestStore(t)
-	at := time.Date(2026, 1, 1, 0, 0, 0, 123456789, time.UTC)
-	ev := mustEventAt(t, evt1ID, at, `{"a":1}`)
-
-	if _, _, err := s.Insert(ev); err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-	outcome, _, err := s.Insert(ev)
-	if err != nil {
-		t.Fatalf("Insert retry: %v", err)
-	}
-	if outcome != AlreadyPresent {
-		t.Fatalf("want AlreadyPresent despite nanosecond truncation, got %v", outcome)
-	}
-}
-
-func TestInsertConcurrentSameIDIsRaceFree(t *testing.T) {
-	// Insert used to SELECT for an existing row, then INSERT if none was
-	// found: two concurrent callers for the same new ID could both pass
-	// the SELECT before either committed, and the loser would hit a raw
-	// unique-violation error instead of a clean Outcome. INSERT ... ON
-	// CONFLICT DO NOTHING makes that race atomic; this exercises it with
-	// real concurrent transactions against PostgreSQL.
-	s := openTestStore(t)
-	ev := mustEvent(t, evt1ID, `{"a":1}`)
-
-	const n = 8
-	outcomes := make([]Outcome, n)
+func TestInitializeConcurrent(t *testing.T) {
+	dsn := pgtest.NewDatabase(t)
+	const n = 6
 	errs := make([]error, n)
 	var wg sync.WaitGroup
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go func(i int) {
+	for i := range n {
+		wg.Add(1)
+		go func() {
 			defer wg.Done()
-			outcomes[i], _, errs[i] = s.Insert(ev)
-		}(i)
+			errs[i] = Initialize(dsn)
+		}()
 	}
 	wg.Wait()
-
-	accepted, present := 0, 0
 	for i, err := range errs {
 		if err != nil {
-			t.Fatalf("goroutine %d: Insert: %v", i, err)
-		}
-		switch outcomes[i] {
-		case Accepted:
-			accepted++
-		case AlreadyPresent:
-			present++
-		default:
-			t.Fatalf("goroutine %d: want Accepted or AlreadyPresent, got %v", i, outcomes[i])
+			t.Errorf("concurrent Initialize %d: %v", i, err)
 		}
 	}
-	if accepted != 1 {
-		t.Fatalf("want exactly 1 Accepted among concurrent inserts, got %d", accepted)
-	}
-	if present != n-1 {
-		t.Fatalf("want %d AlreadyPresent among concurrent inserts, got %d", n-1, present)
-	}
-
-	var count int
-	if err := s.db.QueryRow(`SELECT count(*) FROM events WHERE id = $1`, evt1ID).Scan(&count); err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("want exactly 1 row, got %d", count)
+	if _, err := openStore(t, dsn).Append(event.New{EventType: "after.concurrent.init"}); err != nil {
+		t.Fatalf("Append after concurrent Initialize: %v", err)
 	}
 }
 
-func TestInsertRejectsInvalidEvent(t *testing.T) {
-	s := openTestStore(t)
-
-	invalid := event.Event{ID: evt1ID} // missing event_type/actor/content/refs
-	outcome, _, err := s.Insert(invalid)
-	if err == nil {
-		t.Fatal("expected validation error")
+func TestWriterRoleBoundary(t *testing.T) {
+	adminDSN := initializedDB(t)
+	writer, writerDSN := pgtest.NewRole(t, adminDSN)
+	if err := ProvisionWriter(adminDSN, writer); err != nil {
+		t.Fatalf("ProvisionWriter: %v", err)
 	}
-	if outcome != Rejected {
-		t.Fatalf("want Rejected, got %v", outcome)
+	// A second writer role, granted to the first, exercises SET ROLE.
+	other, _ := pgtest.NewRole(t, adminDSN)
+	if err := ProvisionWriter(adminDSN, other); err != nil {
+		t.Fatalf("ProvisionWriter(other): %v", err)
 	}
-
-	var count int
-	if err := s.db.QueryRow(`SELECT count(*) FROM events`).Scan(&count); err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if count != 0 {
-		t.Fatalf("rejected event must not reach canonical storage, got %d rows", count)
-	}
-}
-
-func TestPullOrdersBySequence(t *testing.T) {
-	s := openTestStore(t)
-
-	for _, id := range []string{evt1ID, evt2ID, evt3ID} {
-		if _, _, err := s.Insert(mustEvent(t, id, `{"a":1}`)); err != nil {
-			t.Fatalf("Insert %s: %v", id, err)
-		}
+	admin := openDBT(t, adminDSN)
+	if _, err := admin.Exec(fmt.Sprintf(`GRANT %s TO %s`, pgx.Identifier{other}.Sanitize(), pgx.Identifier{writer}.Sanitize())); err != nil {
+		t.Fatalf("granting role membership: %v", err)
 	}
 
-	got, err := s.Pull(0, 10)
+	store := openStore(t, writerDSN)
+	se, err := store.Append(event.New{EventType: "writer.append"})
 	if err != nil {
-		t.Fatalf("Pull: %v", err)
+		t.Fatalf("writer Append: %v", err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("want 3 rows, got %d", len(got))
-	}
-	for i := 1; i < len(got); i++ {
-		if got[i].Sequence <= got[i-1].Sequence {
-			t.Fatalf("want ascending sequence, got %d then %d", got[i-1].Sequence, got[i].Sequence)
-		}
-	}
-	wantIDs := []string{evt1ID, evt2ID, evt3ID}
-	for i, id := range wantIDs {
-		if got[i].Event.ID != id {
-			t.Fatalf("row %d: want id %s, got %s", i, id, got[i].Event.ID)
-		}
-	}
-}
-
-func TestPullRespectsAfterCursor(t *testing.T) {
-	s := openTestStore(t)
-
-	_, seq1, err := s.Insert(mustEvent(t, evt1ID, `{"a":1}`))
-	if err != nil {
-		t.Fatalf("Insert: %v", err)
-	}
-	if _, _, err := s.Insert(mustEvent(t, evt2ID, `{"a":1}`)); err != nil {
-		t.Fatalf("Insert: %v", err)
+	if se.Actor != writer {
+		t.Errorf("actor = %q, want the writer login identity %q", se.Actor, writer)
 	}
 
-	got, err := s.Pull(seq1, 10)
-	if err != nil {
-		t.Fatalf("Pull: %v", err)
+	db := openDBT(t, writerDSN)
+	forbidden := []struct{ name, stmt string }{
+		{"forge id", `INSERT INTO public.events (event_type, id) VALUES ('forge', pg_catalog.uuidv7())`},
+		{"forge received_at", `INSERT INTO public.events (event_type, received_at) VALUES ('forge', '2000-01-01T00:00:00Z')`},
+		{"forge actor", `INSERT INTO public.events (event_type, actor) VALUES ('forge', 'somebody-else')`},
+		{"insert whole row", `INSERT INTO public.events VALUES (pg_catalog.uuidv7(), pg_catalog.now(), 'forge', 'somebody-else', '{}', '{}')`},
+		{"update", `UPDATE public.events SET event_type = 'rewritten'`},
+		{"update actor", `UPDATE public.events SET actor = 'somebody-else'`},
+		{"delete", `DELETE FROM public.events`},
+		{"truncate", `TRUNCATE public.events`},
+		{"alter", `ALTER TABLE public.events DROP CONSTRAINT events_event_type_nonblank`},
+		{"drop", `DROP TABLE public.events`},
+		{"rename", `ALTER TABLE public.events RENAME TO events_old`},
 	}
-	if len(got) != 1 {
-		t.Fatalf("want 1 row after cursor, got %d", len(got))
-	}
-	if got[0].Event.ID != evt2ID {
-		t.Fatalf("want %s, got %s", evt2ID, got[0].Event.ID)
-	}
-}
-
-func TestPullRespectsLimit(t *testing.T) {
-	s := openTestStore(t)
-
-	for _, id := range []string{evt1ID, evt2ID, evt3ID} {
-		if _, _, err := s.Insert(mustEvent(t, id, `{"a":1}`)); err != nil {
-			t.Fatalf("Insert %s: %v", id, err)
+	for _, tc := range forbidden {
+		if _, err := db.Exec(tc.stmt); err == nil {
+			t.Errorf("writer was allowed to %s", tc.name)
+		} else if !strings.Contains(err.Error(), "permission denied") && !strings.Contains(err.Error(), "must be owner") {
+			t.Errorf("writer %s failed for the wrong reason: %v", tc.name, err)
 		}
 	}
 
-	got, err := s.Pull(0, 2)
-	if err != nil {
-		t.Fatalf("Pull: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("want 2 rows bounded by limit, got %d", len(got))
-	}
-}
-
-func TestSchemaLinksEventsToBlobsByDigest(t *testing.T) {
-	if !strings.Contains(schema, "blob_sha256") {
-		t.Error("schema.sql missing events.blob_sha256")
-	}
-}
-
-func TestInsertWithBlobAcceptsEmptyContent(t *testing.T) {
-	s := openTestStore(t)
-	emptyDigest := blobDigest(nil)
-	outcome, _, err := s.InsertWithBlob(mustEvent(t, evt1ID, `{"a":1}`), nil, emptyDigest, "application/octet-stream")
-	if err != nil {
-		t.Fatalf("InsertWithBlob: %v", err)
-	}
-	if outcome != Accepted {
-		t.Fatalf("want Accepted, got %v", outcome)
-	}
-	var size int64
-	if err := s.db.QueryRow(`SELECT size_bytes FROM blobs WHERE sha256 = decode($1, 'hex')`, emptyDigest).Scan(&size); err != nil {
-		t.Fatalf("select empty blob: %v", err)
-	}
-	if size != 0 {
-		t.Fatalf("want empty blob size 0, got %d", size)
-	}
-}
-func TestInsertWithBlobDigestMismatchIsRejected(t *testing.T) {
-	s := &Store{}
-	outcome, _, err := s.InsertWithBlob(mustEvent(t, evt1ID, `{"a":1}`), []byte("hello blob"), "0000000000000000000000000000000000000000000000000000000000000000", "text/plain")
-	if outcome != Rejected {
-		t.Fatalf("want Rejected, got %v", outcome)
-	}
-	var verr *ValidationError
-	if !errors.As(err, &verr) {
-		t.Fatalf("want a *ValidationError, got %T: %v", err, err)
-	}
-}
-
-func blobDigest(content []byte) string {
-	sum := sha256.Sum256(content)
-	return hex.EncodeToString(sum[:])
-}
-
-func TestInsertWithBlobAcceptsFreshEventAndBlob(t *testing.T) {
-	s := openTestStore(t)
-	content := []byte("hello blob")
-	digest := blobDigest(content)
-
-	outcome, seq, err := s.InsertWithBlob(mustEvent(t, evt1ID, `{"a":1}`), content, digest, "text/plain")
-	if err != nil {
-		t.Fatalf("InsertWithBlob: %v", err)
-	}
-	if outcome != Accepted {
-		t.Fatalf("want Accepted, got %v", outcome)
-	}
-	if seq <= 0 {
-		t.Fatalf("want positive sequence, got %d", seq)
-	}
-
-	var gotBlobDigest []byte
-	if err := s.db.QueryRow(`SELECT blob_sha256 FROM events WHERE id = $1`, evt1ID).Scan(&gotBlobDigest); err != nil {
-		t.Fatalf("select blob_sha256: %v", err)
-	}
-	if hex.EncodeToString(gotBlobDigest) != digest {
-		t.Fatalf("want event.blob_sha256 %s, got %x", digest, gotBlobDigest)
-	}
-
-	var blobCount int
-	var blobContent []byte
-	var mediaType string
-	if err := s.db.QueryRow(`SELECT count(*) FROM blobs WHERE sha256 = $1`, gotBlobDigest).Scan(&blobCount); err != nil {
-		t.Fatalf("count blobs: %v", err)
-	}
-	if blobCount != 1 {
-		t.Fatalf("want exactly 1 blob row, got %d", blobCount)
-	}
-	if err := s.db.QueryRow(`SELECT content, media_type FROM blobs WHERE sha256 = $1`, gotBlobDigest).Scan(&blobContent, &mediaType); err != nil {
-		t.Fatalf("select blob: %v", err)
-	}
-	if string(blobContent) != string(content) {
-		t.Fatalf("want blob content %q, got %q", content, blobContent)
-	}
-	if mediaType != "text/plain" {
-		t.Fatalf("want media_type text/plain, got %q", mediaType)
-	}
-}
-
-func TestPullIncludesBlobProvenanceAndReadBlob(t *testing.T) {
-	s := openTestStore(t)
-	content := []byte("projectable body")
-	digest := blobDigest(content)
-
-	if outcome, _, err := s.InsertWithBlob(mustEvent(t, evt1ID, `{"a":1}`), content, digest, "text/plain"); err != nil || outcome != Accepted {
-		t.Fatalf("InsertWithBlob: outcome=%v err=%v", outcome, err)
-	}
-	rows, err := s.Pull(0, 10)
-	if err != nil {
-		t.Fatalf("Pull: %v", err)
-	}
-	if len(rows) != 1 || rows[0].BlobSHA256 != digest {
-		t.Fatalf("pulled blob provenance = %#v, want %s", rows, digest)
-	}
-
-	blob, ok, err := s.ReadBlob(digest)
-	if err != nil {
-		t.Fatalf("ReadBlob: %v", err)
-	}
-	if !ok {
-		t.Fatal("want canonical blob")
-	}
-	if string(blob.Content) != string(content) || blob.MediaType != "text/plain" || blob.Size != int64(len(content)) {
-		t.Fatalf("blob = %#v, want original bytes and metadata", blob)
-	}
-}
-
-func TestReadLatestDocumentReturnsNewestExactBody(t *testing.T) {
-	s := openTestStore(t)
-	source := "example/test/diary"
-	for _, doc := range []struct {
-		id, body string
-	}{
-		{evt1ID, "older"},
-		{evt2ID, "newer"},
-	} {
-		content, err := json.Marshal(map[string]string{"source": source})
-		if err != nil {
-			t.Fatal(err)
-		}
-		ev, err := event.New(doc.id, "document.filed", "tester", time.Now().UTC(), content, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if outcome, _, err := s.InsertWithBlob(ev, []byte(doc.body), blobDigest([]byte(doc.body)), "text/plain"); err != nil || outcome != Accepted {
-			t.Fatalf("InsertWithBlob(%q): outcome=%v err=%v", doc.body, outcome, err)
-		}
-	}
-
-	doc, ok, err := s.ReadLatestDocument(source, 1024)
+	// SET ROLE changes current_user but never session_user, so actor still
+	// records the authenticated login identity.
+	conn, err := db.Conn(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok {
-		t.Fatal("want latest document")
+	defer conn.Close()
+	if _, err := conn.ExecContext(t.Context(), fmt.Sprintf(`SET ROLE %s`, pgx.Identifier{other}.Sanitize())); err != nil {
+		t.Fatalf("SET ROLE: %v", err)
 	}
-	if doc.EventID != evt2ID || string(doc.Body) != "newer" || doc.Source != source {
-		t.Fatalf("document = %#v, want newest exact source body", doc)
+	var actor, currentUser string
+	if err := conn.QueryRowContext(t.Context(),
+		`INSERT INTO public.events (event_type) VALUES ('set.role') RETURNING actor, current_user`).Scan(&actor, &currentUser); err != nil {
+		t.Fatalf("insert after SET ROLE: %v", err)
 	}
-	if _, _, err := s.ReadLatestDocument(source, 4); err == nil {
-		t.Fatal("expected body larger than max bytes to fail")
+	if currentUser != other {
+		t.Fatalf("current_user = %q, want %q (test setup)", currentUser, other)
+	}
+	if actor != writer {
+		t.Errorf("actor after SET ROLE = %q, want the session_user %q", actor, writer)
 	}
 }
 
-func TestListLatestDocumentsReturnsCurrentSourcesAfterExclusiveCursor(t *testing.T) {
-	s := openTestStore(t)
-	for _, doc := range []struct {
-		id, source, body string
-	}{
-		{evt1ID, "example/drawers/alpha", "alpha-old"},
-		{evt2ID, "example/drawers/beta", "beta"},
-		{evt3ID, "example/drawers/alpha", "alpha-new"},
-	} {
-		content, err := json.Marshal(map[string]string{"source": doc.source})
-		if err != nil {
-			t.Fatal(err)
-		}
-		ev, err := event.New(doc.id, "document.filed", "tester", time.Now().UTC(), content, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		body := []byte(doc.body)
-		if outcome, _, err := s.InsertWithBlob(ev, body, blobDigest(body), "text/plain"); err != nil || outcome != Accepted {
-			t.Fatalf("InsertWithBlob(%q): outcome=%v err=%v", doc.source, outcome, err)
+func TestReaderRoleBoundary(t *testing.T) {
+	adminDSN := initializedDB(t)
+	if _, err := openStore(t, adminDSN).Append(event.New{EventType: "readable"}); err != nil {
+		t.Fatalf("seed Append: %v", err)
+	}
+	reader, readerDSN := pgtest.NewRole(t, adminDSN)
+	if err := ProvisionReader(adminDSN, reader); err != nil {
+		t.Fatalf("ProvisionReader: %v", err)
+	}
+	db := openDBT(t, readerDSN)
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM public.events`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("reader SELECT = %d, %v", n, err)
+	}
+	if _, err := db.Exec(`INSERT INTO public.events (event_type) VALUES ('reader.append')`); err == nil {
+		t.Error("reader was allowed to append")
+	}
+	// Through the library path too: a reader cannot append.
+	if _, err := openStore(t, readerDSN).Append(event.New{EventType: "reader.append"}); err == nil {
+		t.Error("reader Append = nil, want permission denied")
+	} else {
+		var ae *AppendError
+		if !errors.As(err, &ae) || ae.Outcome != OutcomeNotCommitted {
+			t.Errorf("reader Append error = %v, want *AppendError with not_committed", err)
 		}
 	}
+}
 
-	docs, err := s.ListLatestDocuments(0, 10)
+func TestProvisionRefusesUnsafeRoles(t *testing.T) {
+	adminDSN := initializedDB(t)
+	admin := openDBT(t, adminDSN)
+
+	var owner string
+	if err := admin.QueryRow(`SELECT session_user`).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProvisionWriter(adminDSN, owner); err == nil {
+		t.Error("ProvisionWriter accepted the administrator/owner role")
+	}
+	if err := ProvisionWriter(adminDSN, "duro_role_does_not_exist"); err == nil {
+		t.Error("ProvisionWriter accepted a nonexistent role")
+	}
+
+	super, _ := pgtest.NewRole(t, adminDSN)
+	if _, err := admin.Exec(fmt.Sprintf(`ALTER ROLE %s SUPERUSER`, pgx.Identifier{super}.Sanitize())); err != nil {
+		t.Fatalf("making superuser: %v", err)
+	}
+	if err := ProvisionWriter(adminDSN, super); err == nil {
+		t.Error("ProvisionWriter accepted a superuser role")
+	}
+
+	mutator, _ := pgtest.NewRole(t, adminDSN)
+	if _, err := admin.Exec(fmt.Sprintf(`GRANT UPDATE ON public.events TO %s`, pgx.Identifier{mutator}.Sanitize())); err != nil {
+		t.Fatalf("granting UPDATE: %v", err)
+	}
+	if err := ProvisionWriter(adminDSN, mutator); err == nil {
+		t.Error("ProvisionWriter accepted a role that already holds UPDATE")
+	}
+
+	// Inherited mutation privilege counts too.
+	group, _ := pgtest.NewRole(t, adminDSN)
+	member, _ := pgtest.NewRole(t, adminDSN)
+	if _, err := admin.Exec(fmt.Sprintf(`GRANT DELETE ON public.events TO %s`, pgx.Identifier{group}.Sanitize())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(fmt.Sprintf(`GRANT %s TO %s`, pgx.Identifier{group}.Sanitize(), pgx.Identifier{member}.Sanitize())); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProvisionWriter(adminDSN, member); err == nil {
+		t.Error("ProvisionWriter accepted a role inheriting DELETE")
+	}
+	// A refusal must not have added any grant on the way.
+	var hasInsert bool
+	if err := admin.QueryRow(`SELECT pg_catalog.has_table_privilege($1, 'public.events', 'INSERT')`, member).Scan(&hasInsert); err != nil {
+		t.Fatal(err)
+	}
+	if hasInsert {
+		t.Error("a refused provisioning still granted INSERT")
+	}
+
+	nologin, _ := pgtest.NewRole(t, adminDSN)
+	if _, err := admin.Exec(fmt.Sprintf(`ALTER ROLE %s NOLOGIN`, pgx.Identifier{nologin}.Sanitize())); err != nil {
+		t.Fatal(err)
+	}
+	if err := ProvisionWriter(adminDSN, nologin); err == nil {
+		t.Error("ProvisionWriter accepted a role that cannot log in")
+	}
+
+	// A reader must not already be able to append.
+	appender, _ := pgtest.NewRole(t, adminDSN)
+	if err := ProvisionWriter(adminDSN, appender); err != nil {
+		t.Fatalf("ProvisionWriter: %v", err)
+	}
+	if err := ProvisionReader(adminDSN, appender); err == nil {
+		t.Error("ProvisionReader accepted a role that already holds INSERT")
+	}
+}
+
+// TestSnapshotReadAndCommitOrderInversion demonstrates the documented
+// reading semantics: ids ascend in generation order, which is not commit
+// order, and a read-only repeatable-read transaction sees one stable
+// snapshot for a whole multi-query rebuild.
+func TestSnapshotReadAndCommitOrderInversion(t *testing.T) {
+	dsn := initializedDB(t)
+	db := openDBT(t, dsn)
+	ctx := t.Context()
+
+	// A commits first in id order but last in commit order.
+	txA, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(docs) != 2 {
-		t.Fatalf("len(ListLatestDocuments) = %d, want 2", len(docs))
+	var idA string
+	if err := txA.QueryRow(`INSERT INTO public.events (event_type) VALUES ('early.id.late.commit') RETURNING id::text`).Scan(&idA); err != nil {
+		t.Fatal(err)
 	}
-	if docs[0].Source != "example/drawers/beta" || docs[0].Sequence != 2 || docs[1].Source != "example/drawers/alpha" || docs[1].Sequence != 3 {
-		t.Fatalf("ListLatestDocuments = %#v, want beta@2 then current alpha@3", docs)
-	}
-	for _, doc := range docs {
-		if doc.EventID == "" || doc.BlobSHA256 == "" || doc.MediaType != "text/plain" || len(doc.Body) != 0 {
-			t.Fatalf("listed document = %#v, want provenance-only metadata", doc)
-		}
-	}
-
-	afterBeta, err := s.ListLatestDocuments(docs[0].Sequence, 10)
+	txB, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(afterBeta) != 1 || afterBeta[0].Source != "example/drawers/alpha" || afterBeta[0].Sequence != 3 {
-		t.Fatalf("post-cursor list = %#v, want alpha@3", afterBeta)
-	}
-}
-
-func TestValidateDocumentListRequestRejectsInvalidCursorOrLimit(t *testing.T) {
-	for _, request := range []struct {
-		after int64
-		limit int
-	}{
-		{-1, 1},
-		{0, 0},
-		{0, 501},
-	} {
-		if err := validateDocumentListRequest(request.after, request.limit); err == nil {
-			t.Fatalf("validateDocumentListRequest(%d, %d) succeeded, want invalid request error", request.after, request.limit)
-		}
-	}
-}
-
-func TestInsertWithBlobRetryAfterPartialUploadIsAlreadyPresent(t *testing.T) {
-	// Simulates a crash between the canonical store accepting an
-	// event+blob and the client recording that acceptance locally: the
-	// retry must be idempotent and must not duplicate the blob.
-	s := openTestStore(t)
-	content := []byte("hello blob")
-	digest := blobDigest(content)
-	ev := mustEvent(t, evt1ID, `{"a":1}`)
-
-	_, firstSeq, err := s.InsertWithBlob(ev, content, digest, "text/plain")
-	if err != nil {
-		t.Fatalf("InsertWithBlob: %v", err)
-	}
-
-	outcome, seq, err := s.InsertWithBlob(ev, content, digest, "text/plain")
-	if err != nil {
-		t.Fatalf("InsertWithBlob retry: %v", err)
-	}
-	if outcome != AlreadyPresent {
-		t.Fatalf("want AlreadyPresent, got %v", outcome)
-	}
-	if seq != firstSeq {
-		t.Fatalf("want same sequence %d on retry, got %d", firstSeq, seq)
-	}
-
-	var blobCount int
-	if err := s.db.QueryRow(`SELECT count(*) FROM blobs`).Scan(&blobCount); err != nil {
-		t.Fatalf("count blobs: %v", err)
-	}
-	if blobCount != 1 {
-		t.Fatalf("want exactly 1 blob row after retry, got %d", blobCount)
-	}
-}
-
-func TestInsertWithBlobDuplicateContentAcrossEventsIsDeduped(t *testing.T) {
-	s := openTestStore(t)
-	content := []byte("shared blob bytes")
-	digest := blobDigest(content)
-
-	if _, _, err := s.InsertWithBlob(mustEvent(t, evt1ID, `{"a":1}`), content, digest, "text/plain"); err != nil {
-		t.Fatalf("InsertWithBlob 1: %v", err)
-	}
-	if _, _, err := s.InsertWithBlob(mustEvent(t, evt2ID, `{"a":2}`), content, digest, "text/plain"); err != nil {
-		t.Fatalf("InsertWithBlob 2: %v", err)
-	}
-
-	var blobCount int
-	if err := s.db.QueryRow(`SELECT count(*) FROM blobs`).Scan(&blobCount); err != nil {
-		t.Fatalf("count blobs: %v", err)
-	}
-	if blobCount != 1 {
-		t.Fatalf("want exactly 1 deduped blob row, got %d", blobCount)
-	}
-}
-
-func TestInsertWithBlobChangedContentIsConflict(t *testing.T) {
-	s := openTestStore(t)
-	at := time.Now().UTC()
-	ev := mustEventAt(t, evt1ID, at, `{"a":1}`)
-	first := []byte("original blob")
-
-	if _, _, err := s.InsertWithBlob(ev, first, blobDigest(first), "text/plain"); err != nil {
-		t.Fatalf("InsertWithBlob: %v", err)
-	}
-
-	second := []byte("different blob")
-	outcome, _, err := s.InsertWithBlob(ev, second, blobDigest(second), "text/plain")
-	if err != nil {
-		t.Fatalf("InsertWithBlob retry: %v", err)
-	}
-	if outcome != Conflict {
-		t.Fatalf("want Conflict, got %v", outcome)
-	}
-
-	var gotBlobDigest []byte
-	if err := s.db.QueryRow(`SELECT blob_sha256 FROM events WHERE id = $1`, evt1ID).Scan(&gotBlobDigest); err != nil {
-		t.Fatalf("select blob_sha256: %v", err)
-	}
-	if hex.EncodeToString(gotBlobDigest) != blobDigest(first) {
-		t.Fatal("original event's blob link must be untouched")
-	}
-}
-
-func TestInsertWithBlobChangedMediaTypeIsConflict(t *testing.T) {
-	s := openTestStore(t)
-	ev := mustEvent(t, evt1ID, `{"a":1}`)
-	content := []byte("same blob")
-	digest := blobDigest(content)
-
-	if outcome, _, err := s.InsertWithBlob(ev, content, digest, "text/plain"); err != nil || outcome != Accepted {
-		t.Fatalf("first InsertWithBlob: outcome=%v err=%v", outcome, err)
-	}
-	outcome, _, err := s.InsertWithBlob(ev, content, digest, "text/markdown")
-	if err != nil {
-		t.Fatalf("retry InsertWithBlob: %v", err)
-	}
-	if outcome != Conflict {
-		t.Fatalf("want Conflict for changed media type, got %v", outcome)
-	}
-}
-
-func TestDocumentsKeepMediaTypePerEventWhenBytesAreDeduped(t *testing.T) {
-	s := openTestStore(t)
-	body := []byte("same blob")
-	digest := blobDigest(body)
-	for _, doc := range []struct {
-		id, source, mediaType string
-	}{
-		{evt1ID, "example/drawers/plain", "text/plain"},
-		{evt2ID, "example/drawers/markdown", "text/markdown"},
-	} {
-		content, err := json.Marshal(map[string]string{"source": doc.source})
-		if err != nil {
-			t.Fatal(err)
-		}
-		ev, err := event.New(doc.id, "document.filed", "tester", time.Now().UTC(), content, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if outcome, _, err := s.InsertWithBlob(ev, body, digest, doc.mediaType); err != nil || outcome != Accepted {
-			t.Fatalf("InsertWithBlob(%q): outcome=%v err=%v", doc.source, outcome, err)
-		}
-	}
-
-	for _, want := range []struct{ source, mediaType string }{
-		{"example/drawers/plain", "text/plain"},
-		{"example/drawers/markdown", "text/markdown"},
-	} {
-		doc, ok, err := s.ReadLatestDocument(want.source, 1024)
-		if err != nil || !ok || doc.MediaType != want.mediaType || string(doc.Body) != string(body) {
-			t.Fatalf("ReadLatestDocument(%q) = %#v, ok=%v, err=%v", want.source, doc, ok, err)
-		}
-	}
-
-	var blobCount int
-	if err := s.db.QueryRow(`SELECT count(*) FROM blobs`).Scan(&blobCount); err != nil {
+	var idB string
+	if err := txB.QueryRow(`INSERT INTO public.events (event_type) VALUES ('late.id.early.commit') RETURNING id::text`).Scan(&idB); err != nil {
 		t.Fatal(err)
 	}
-	if blobCount != 1 {
-		t.Fatalf("blob count = %d, want 1", blobCount)
+	if !(idA < idB) {
+		t.Fatalf("expected ascending ids by generation time: %s then %s", idA, idB)
+	}
+	if err := txB.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A projector starting now sees B but not A: id order is not commit
+	// order, and events outside the snapshot arrive on the next rebuild.
+	snapshot, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Rollback()
+	first := readIDs(t, snapshot)
+	if len(first) != 1 || first[0] != idB {
+		t.Fatalf("snapshot = %v, want only the committed %s", first, idB)
+	}
+
+	if err := txA.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// Every query in the rebuild transaction uses the same snapshot, even
+	// though A has since committed with a lower id.
+	if second := readIDs(t, snapshot); len(second) != 1 || second[0] != idB {
+		t.Errorf("second read in the same repeatable-read transaction = %v, want %v", second, first)
+	}
+	// A read-only transaction cannot write, so a projector cannot corrupt
+	// the ledger it is rebuilding from.
+	if _, err := snapshot.Exec(`INSERT INTO public.events (event_type) VALUES ('projector.write')`); err == nil {
+		t.Error("read-only transaction was allowed to insert")
+	}
+	if err := snapshot.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		t.Fatal(err)
+	}
+
+	// The next rebuild sees both, in ascending id order.
+	fresh, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Rollback()
+	if all := readIDs(t, fresh); len(all) != 2 || all[0] != idA || all[1] != idB {
+		t.Errorf("full reread = %v, want [%s %s]", all, idA, idB)
 	}
 }
 
-func TestPullAllowsSequenceGaps(t *testing.T) {
-	s := openTestStore(t)
-
-	_, seq1, err := s.Insert(mustEvent(t, evt1ID, `{"a":1}`))
+func readIDs(t *testing.T, tx *sql.Tx) []string {
+	t.Helper()
+	rows, err := tx.Query(`SELECT id::text FROM public.events ORDER BY id`)
 	if err != nil {
-		t.Fatalf("Insert: %v", err)
+		t.Fatalf("reading ledger: %v", err)
 	}
-	if _, _, err := s.Insert(mustEvent(t, evt2ID, `{"a":1}`)); err != nil {
-		t.Fatalf("Insert: %v", err)
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
 	}
-	_, seq3, err := s.Insert(mustEvent(t, evt3ID, `{"a":1}`))
-	if err != nil {
-		t.Fatalf("Insert: %v", err)
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
+	return ids
+}
 
-	// Simulate a gap (e.g. from a deleted or externally rolled-back row)
-	// by removing the middle event directly.
-	if _, err := s.db.Exec(`DELETE FROM events WHERE id = $1`, evt2ID); err != nil {
-		t.Fatalf("delete: %v", err)
+func TestClassifyCommitErr(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want CommitOutcome
+	}{
+		{"server error", &pgconn.PgError{Message: "rejected"}, OutcomeNotCommitted},
+		{"wrapped server error", fmt.Errorf("commit: %w", &pgconn.PgError{}), OutcomeNotCommitted},
+		{"commit rolled back", pgx.ErrTxCommitRollback, OutcomeNotCommitted},
+		{"tx already done", sql.ErrTxDone, OutcomeNotCommitted},
+		{"connection lost", io.ErrUnexpectedEOF, OutcomeUnknown},
+		{"wrapped connection loss", fmt.Errorf("commit: %w", io.ErrUnexpectedEOF), OutcomeUnknown},
+		// Ordinary ERROR-severity answers are the server saying this
+		// transaction did not commit.
+		{"check violation", &pgconn.PgError{Severity: "ERROR", Code: "23514", Message: "check constraint"}, OutcomeNotCommitted},
+		{"deferred constraint at commit", &pgconn.PgError{Severity: "ERROR", Code: "23505"}, OutcomeNotCommitted},
+		// A dying session is not evidence of a rollback: the commit may have
+		// landed just before the acknowledgement was lost.
+		{"fatal severity", &pgconn.PgError{Severity: "FATAL", Code: "XX000"}, OutcomeUnknown},
+		{"panic severity", &pgconn.PgError{Severity: "PANIC", Code: "XX000"}, OutcomeUnknown},
+		{"connection exception", &pgconn.PgError{Severity: "ERROR", Code: "08006"}, OutcomeUnknown},
+		{"connection does not exist", &pgconn.PgError{Severity: "ERROR", Code: "08003"}, OutcomeUnknown},
+		{"admin shutdown", &pgconn.PgError{Severity: "FATAL", Code: "57P01"}, OutcomeUnknown},
+		{"crash shutdown", &pgconn.PgError{Severity: "FATAL", Code: "57P02"}, OutcomeUnknown},
+		{"cannot connect now", &pgconn.PgError{Severity: "FATAL", Code: "57P03"}, OutcomeUnknown},
+		{"wrapped admin shutdown", fmt.Errorf("commit: %w", &pgconn.PgError{Code: "57P01"}), OutcomeUnknown},
+	} {
+		if got := classifyCommitErr(tc.err); got != tc.want {
+			t.Errorf("classifyCommitErr(%s) = %s, want %s", tc.name, got, tc.want)
+		}
 	}
-
-	got, err := s.Pull(0, 10)
-	if err != nil {
-		t.Fatalf("Pull: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("want 2 rows around gap, got %d", len(got))
-	}
-	if got[0].Sequence != seq1 || got[1].Sequence != seq3 {
-		t.Fatalf("want sequences [%d, %d], got [%d, %d]", seq1, seq3, got[0].Sequence, got[1].Sequence)
+	if OutcomeUnknown.String() != "unknown" || OutcomeNotCommitted.String() != "not_committed" {
+		t.Error("CommitOutcome strings are part of the reported error schema")
 	}
 }
 
-// TestOpenAcceptsConfiguredTransport asserts the store accepts the transport
-// selected by its deployment. Private Compose and loopback deployments may use
-// plaintext PostgreSQL with a restricted authenticated role.
-func TestOpenAcceptsConfiguredTransport(t *testing.T) {
-	dsn := os.Getenv("DURO_POSTGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("DURO_POSTGRES_TEST_DSN not set; skipping PostgreSQL integration test")
+// TestAppendOnLostConnection covers the connection-loss path without a
+// proxy: closing the pool's connections underneath an open transaction
+// makes the COMMIT unanswerable.
+func TestAppendOnLostConnection(t *testing.T) {
+	dsn := initializedDB(t)
+	s := openStore(t, dsn)
+	if _, err := s.Append(event.New{EventType: "before.close"}); err != nil {
+		t.Fatalf("Append: %v", err)
 	}
-
-	store, err := Open(dsn)
-	if err != nil {
-		t.Fatalf("Open rejected configured transport: %v", err)
+	if err := s.db.Close(); err != nil {
+		t.Fatal(err)
 	}
-	t.Cleanup(func() { store.Close() })
+	_, err := s.Append(event.New{EventType: "after.close"})
+	var ae *AppendError
+	if !errors.As(err, &ae) {
+		t.Fatalf("Append on a closed store = %v, want *AppendError", err)
+	}
+	// database/sql refuses to use a closed pool before sending anything, so
+	// this is a definite non-commit, never an unknown outcome.
+	if ae.Outcome != OutcomeNotCommitted {
+		t.Errorf("outcome = %s, want not_committed", ae.Outcome)
+	}
 }

@@ -1,124 +1,95 @@
-// Package event defines the minimal event value Duro carries between the
-// local SQLite queue and the PostgreSQL canonical store. It has no
-// hash-chain fields and no event-type-specific structs: Content and Refs
-// are opaque, validated JSON objects, and the boundary rules here are the
-// only shape Duro enforces.
+// Package event defines the minimal event shape Duro appends to its
+// PostgreSQL ledger: an event type plus two opaque JSON objects. Identity
+// (id), time (received_at), and authority (actor) are database-owned and
+// never set by this package; see pkg/postgres for the stored, authoritative
+// form.
 package event
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"net/url"
 	"strings"
-	"time"
-	"unicode"
-
-	"github.com/google/uuid"
+	"unicode/utf8"
 )
 
-// MaxJSONBytes bounds the size of Content and Refs, each checked
-// independently.
-const MaxJSONBytes = 1 << 20 // 1 MiB
+// MaxEventTypeBytes bounds EventType's UTF-8 byte length. EventType is
+// stored verbatim in a TEXT column (no normalization occurs), so this raw
+// byte count is the same quantity PostgreSQL's own CHECK constraint
+// enforces.
+//
+// MaxJSONBytes does NOT exist here: Content/Refs are stored as JSONB, which
+// PostgreSQL normalizes (canonical formatting, last-value-wins on duplicate
+// keys) before the 1 MiB limit is measured. A raw byte count of the
+// caller's JSON text is not the same quantity, and rejecting on it client-
+// side would both wrongly reject compact-but-verbose input that normalizes
+// well under the limit and wrongly accept padded input that normalizes
+// over it. PostgreSQL's CHECK on octet_length(content::text) is the sole
+// authority for that limit.
+const MaxEventTypeBytes = 255
 
-// Event is one entry in the ledger: an operational envelope plus flexible
-// JSON content and references.
-type Event struct {
-	ID         string
-	OccurredAt time.Time
-	EventType  string
-	Actor      string
-	Content    json.RawMessage
-	Refs       json.RawMessage
-	// ResourceURI is optional generic event-time logical resource metadata.
-	// Duro preserves it exactly but never dereferences or interprets it.
-	ResourceURI string
+// New is the caller-supplied input to Append: an event type and two
+// optional JSON objects. A nil Content/Refs (the field left entirely
+// unset) defaults to {}. A non-nil but otherwise-empty or explicitly-null
+// value is not defaulted -- it is invalid input and Validate rejects it.
+type New struct {
+	EventType string
+	Content   json.RawMessage
+	Refs      json.RawMessage
 }
 
-// New builds a validated Event. If id is empty, a UUID is generated. If
-// occurredAt is the zero time, it defaults to now (UTC). Nil or empty
-// content/refs default to an empty JSON object.
-func New(id, eventType, actor string, occurredAt time.Time, content, refs json.RawMessage) (Event, error) {
-	return NewWithResourceURI(id, eventType, actor, occurredAt, content, refs, "")
-}
-
-// NewWithResourceURI builds a validated Event with optional exact event-time
-// logical resource metadata. Existing callers can keep using New.
-func NewWithResourceURI(id, eventType, actor string, occurredAt time.Time, content, refs json.RawMessage, resourceURI string) (Event, error) {
-	if id == "" {
-		id = uuid.NewString()
+// Validate checks the boundary rules client-side, before any database round
+// trip: nonblank (including under Unicode whitespace) EventType, valid
+// UTF-8, within MaxEventTypeBytes bytes; and Content/Refs that are each nil
+// (omitted, defaulting to {}) or a JSON object. It does not enforce
+// Content/Refs's 1 MiB limit -- see MaxEventTypeBytes's doc comment --
+// PostgreSQL is authoritative there. This exists to reject obviously-
+// invalid input before opening a transaction, not to replace the database
+// constraints.
+func (n New) Validate() error {
+	if !utf8.ValidString(n.EventType) {
+		return fmt.Errorf("event: event_type must be valid UTF-8")
 	}
-	if occurredAt.IsZero() {
-		occurredAt = time.Now().UTC()
+	if strings.TrimSpace(n.EventType) == "" {
+		return fmt.Errorf("event: event_type is required (nonblank)")
 	}
-	if len(content) == 0 {
-		content = json.RawMessage(`{}`)
+	if len(n.EventType) > MaxEventTypeBytes {
+		return fmt.Errorf("event: event_type exceeds %d UTF-8 bytes", MaxEventTypeBytes)
 	}
-	if len(refs) == 0 {
-		refs = json.RawMessage(`{}`)
-	}
-
-	ev := Event{ID: id, OccurredAt: occurredAt, EventType: eventType, Actor: actor, Content: content, Refs: refs, ResourceURI: resourceURI}
-	if err := ev.Validate(); err != nil {
-		return Event{}, err
-	}
-	return ev, nil
-}
-
-// Validate checks the boundary rules: non-empty ID/EventType/Actor, and
-// Content/Refs that are each a JSON object within MaxJSONBytes.
-func (e Event) Validate() error {
-	if e.ID == "" {
-		return errors.New("event: id is required")
-	}
-	parsed, err := uuid.Parse(e.ID)
-	if err != nil {
-		return fmt.Errorf("event: id must be a UUID: %w", err)
-	}
-	// uuid.Parse accepts non-canonical forms (uppercase, no hyphens, urn:uuid:
-	// prefix, braces). Require the exact canonical lowercase hyphenated form
-	// so two textually different IDs can never refer to the same event.
-	if parsed.String() != e.ID {
-		return fmt.Errorf("event: id must be a canonical lowercase UUID, got %q", e.ID)
-	}
-	if e.EventType == "" {
-		return errors.New("event: event_type is required")
-	}
-	if e.Actor == "" {
-		return errors.New("event: actor is required")
-	}
-	if err := validateObjectJSON("content", e.Content); err != nil {
+	if err := validateObject("content", n.Content); err != nil {
 		return err
 	}
-	if err := validateObjectJSON("refs", e.Refs); err != nil {
+	if err := validateObject("refs", n.Refs); err != nil {
 		return err
-	}
-	if e.ResourceURI != "" {
-		if err := ValidateAbsoluteURI(e.ResourceURI); err != nil {
-			return fmt.Errorf("event: resource_uri must be an absolute URI")
-		}
 	}
 	return nil
 }
 
-// ValidateAbsoluteURI is the one absolute-URI rule Duro applies to opaque
-// caller-supplied URIs: parseable, absolute, and free of whitespace. Scheme
-// and path grammar stay the owning project's business. Event resource URIs
-// and artifact physical locators share it so the two can never drift.
-func ValidateAbsoluteURI(uri string) error {
-	parsed, err := url.ParseRequestURI(uri)
-	if err != nil || !parsed.IsAbs() || strings.IndexFunc(uri, unicode.IsSpace) >= 0 {
-		return fmt.Errorf("event: %q is not an absolute URI", uri)
+// ContentOrDefault returns n.Content, or a literal {} if it was left nil
+// (omitted). A non-nil Content that is empty or explicitly null is not
+// defaulted; Validate rejects it instead.
+func (n New) ContentOrDefault() json.RawMessage {
+	if n.Content == nil {
+		return json.RawMessage(`{}`)
 	}
-	return nil
+	return n.Content
 }
 
-// validateObjectJSON requires b to decode as a JSON object no larger than
-// MaxJSONBytes. Decoding into map[string]json.RawMessage rejects malformed
-// JSON, scalars, and arrays alike.
-func validateObjectJSON(name string, b json.RawMessage) error {
-	if len(b) > MaxJSONBytes {
-		return fmt.Errorf("event: %s exceeds %d bytes", name, MaxJSONBytes)
+// RefsOrDefault returns n.Refs, or a literal {} if it was left nil
+// (omitted). A non-nil Refs that is empty or explicitly null is not
+// defaulted; Validate rejects it instead.
+func (n New) RefsOrDefault() json.RawMessage {
+	if n.Refs == nil {
+		return json.RawMessage(`{}`)
+	}
+	return n.Refs
+}
+
+// validateObject requires b to be nil (caller omitted it; the caller will
+// default it) or to decode as a JSON object. An explicit JSON null, a
+// non-nil empty value, a scalar, or an array is rejected.
+func validateObject(name string, b json.RawMessage) error {
+	if b == nil {
+		return nil
 	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(b, &obj); err != nil {
@@ -126,7 +97,7 @@ func validateObjectJSON(name string, b json.RawMessage) error {
 	}
 	if obj == nil {
 		// json.Unmarshal accepts the literal `null` for a map without
-		// error, leaving obj nil. That is not an object.
+		// error, leaving obj nil. Explicit null is invalid.
 		return fmt.Errorf("event: %s must be a JSON object, got null", name)
 	}
 	return nil

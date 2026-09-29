@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,576 +14,390 @@ import (
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	_ "modernc.org/sqlite"
 
+	"github.com/nseyedtalebi/duro-ledger/internal/pgtest"
 	"github.com/nseyedtalebi/duro-ledger/pkg/postgres"
 )
 
-const testAdvisoryLockKey = 918273645
+// duroBin is the real compiled binary: the CLI contract is tested by running
+// it, not by calling run() in-process.
+var duroBin string
 
-func runCLI(t *testing.T, args ...string) []byte {
-	t.Helper()
-	cmd := exec.Command("go", append([]string{"run", "."}, args...)...)
-	cmd.Env = os.Environ()
-	out, err := cmd.CombinedOutput()
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "duro-bin-*")
 	if err != nil {
-		t.Fatalf("duro %v failed: %v\n%s", args, err, out)
+		panic(err)
 	}
-	return out
+	duroBin = filepath.Join(dir, "duro")
+	out, err := exec.Command("go", "build", "-o", duroBin, ".").CombinedOutput()
+	if err != nil {
+		os.RemoveAll(dir)
+		panic("building duro: " + err.Error() + "\n" + string(out))
+	}
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
 }
 
-// runCLIErr is runCLI for cases that are expected to fail: it returns the
-// error and combined output instead of failing the test.
-func runCLIErr(t *testing.T, args ...string) ([]byte, error) {
+type result struct {
+	stdout, stderr string
+	code           int
+}
+
+// duro runs the binary with a deliberately minimal environment, so
+// environment-fallback behavior is exactly what each test sets.
+func duro(t *testing.T, env []string, args ...string) result {
 	t.Helper()
-	cmd := exec.Command("go", append([]string{"run", "."}, args...)...)
-	cmd.Env = os.Environ()
-	out, err := cmd.CombinedOutput()
-	return out, err
+	cmd := exec.Command(duroBin, args...)
+	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}, env...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	code := 0
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("running duro %v: %v", args, err)
+		}
+		code = exitErr.ExitCode()
+	}
+	return result{stdout.String(), stderr.String(), code}
 }
 
-func TestRootHelpListsCommands(t *testing.T) {
-	for _, args := range [][]string{{"--help"}, {"help"}} {
-		out := string(runCLI(t, args...))
-		for _, want := range []string{"Usage: duro", "init", "append", "file", "sync", "pull", "read", "list", "kg", "artifact"} {
-			if !strings.Contains(out, want) {
-				t.Fatalf("duro %v output %q missing %q", args, out, want)
+// TestHelpExitsZeroWithoutIO checks every help surface: no database, no
+// store root, no environment, exit 0.
+func TestHelpExitsZeroWithoutIO(t *testing.T) {
+	cases := [][]string{
+		{},
+		{"help"},
+		{"--help"},
+		{"-h"},
+		{"init", "--help"},
+		{"append", "--help"},
+		{"artifact"},
+		{"artifact", "--help"},
+		{"artifact", "put", "--help"},
+		{"artifact", "get", "--help"},
+		{"help", "init"},
+		{"help", "append"},
+		{"help", "artifact"},
+		{"help", "artifact", "put"},
+		{"help", "artifact", "get"},
+	}
+	for _, args := range cases {
+		t.Run(strings.Join(append([]string{"duro"}, args...), " "), func(t *testing.T) {
+			got := duro(t, nil, args...)
+			if got.code != 0 {
+				t.Errorf("exit code = %d (stderr: %s)", got.code, got.stderr)
 			}
-		}
+			if len(got.stdout)+len(got.stderr) < 40 {
+				t.Errorf("help output too short: stdout %q stderr %q", got.stdout, got.stderr)
+			}
+			if !strings.Contains(got.stdout+got.stderr, "duro") {
+				t.Errorf("help output does not mention the command: %q%q", got.stdout, got.stderr)
+			}
+		})
 	}
 }
 
-func TestArtifactHelpListsSubcommands(t *testing.T) {
-	for _, args := range [][]string{{"artifact", "--help"}, {"artifact", "put", "--help"}, {"artifact", "verify", "--help"}, {"artifact", "locate", "--help"}} {
-		if out := string(runCLI(t, args...)); !strings.Contains(out, "artifact") {
-			t.Fatalf("duro %v output %q missing artifact help", args, out)
-		}
+func TestBadArgumentsRejected(t *testing.T) {
+	cases := map[string][]string{
+		"unknown command":             {"frobnicate"},
+		"unknown artifact subcommand": {"artifact", "frobnicate"},
+		"init positional":             {"init", "--postgres", "postgres://x/y", "extra"},
+		"append positional":           {"append", "--postgres", "postgres://x/y", "--type", "t", "extra"},
+		"put positional":              {"artifact", "put", "--postgres", "postgres://x/y", "--root", "/nonexistent/duro-store", "--file", "f", "extra"},
+		"get positional":              {"artifact", "get", "--root", "/nonexistent/duro-store", "--sha256", "sha256:" + strings.Repeat("ab", 32), "extra"},
+		"init missing dsn":            {"init"},
+		"append missing dsn":          {"append", "--type", "t"},
+		"append missing type":         {"append", "--postgres", "postgres://x/y"},
+		"append blank type":           {"append", "--postgres", "postgres://x/y", "--type", "  \t "},
+		"append explicit empty json":  {"append", "--postgres", "postgres://x/y", "--type", "t", "--content", ""},
+		"append null content":         {"append", "--postgres", "postgres://x/y", "--type", "t", "--content", "null"},
+		"append array refs":           {"append", "--postgres", "postgres://x/y", "--type", "t", "--refs", "[]"},
+		"append unknown flag":         {"append", "--nope"},
+		"put missing file":            {"artifact", "put", "--postgres", "postgres://x/y", "--root", "/nonexistent/duro-store"},
+		"put missing root":            {"artifact", "put", "--postgres", "postgres://x/y", "--file", "f"},
+		"get missing digest":          {"artifact", "get", "--root", "/nonexistent/duro-store"},
+		"get malformed digest":        {"artifact", "get", "--root", "/nonexistent/duro-store", "--sha256", "deadbeef"},
+		"get bare hex digest":         {"artifact", "get", "--root", "/nonexistent/duro-store", "--sha256", strings.Repeat("ab", 32)},
+	}
+	for name, args := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := duro(t, nil, args...)
+			if got.code == 0 {
+				t.Errorf("exit code = 0, want nonzero (stdout: %q)", got.stdout)
+			}
+			if got.stderr == "" {
+				t.Error("nothing written to stderr")
+			}
+			if got.stdout != "" {
+				t.Errorf("wrote to stdout on failure: %q", got.stdout)
+			}
+		})
 	}
 }
 
-func TestArtifactCommandsRequireTheirInputsBeforeDatabaseAccess(t *testing.T) {
-	for _, args := range [][]string{{"artifact", "put"}, {"artifact", "verify"}, {"artifact", "locate"}} {
-		if _, err := runCLIErr(t, args...); err == nil {
-			t.Fatalf("duro %v succeeded without required input", args)
-		}
+// malformedDigestTouchesNothing: rejecting --sha256 must not create the
+// store root as a side effect.
+func TestMalformedDigestCreatesNoStore(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "store")
+	got := duro(t, nil, "artifact", "get", "--root", root, "--sha256", "sha256:nope")
+	if got.code == 0 {
+		t.Fatal("malformed digest accepted")
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Errorf("store root was created for a rejected request: %v", err)
 	}
 }
 
-func TestAppendEnqueuesLocalEvent(t *testing.T) {
-	dir := t.TempDir()
-	localPath := filepath.Join(dir, "local.sqlite")
-
-	out := runCLI(t, "append", "--local", localPath, "--type", "test.type", "--content", `{"a":1}`)
-	var got appendResult
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("bad json: %v\n%s", err, out)
-	}
-	if got.EventID == "" || !got.Fresh {
-		t.Fatalf("bad result: %+v", got)
-	}
-
-	db, err := sql.Open("sqlite", localPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var count int
-	if err := db.QueryRow(`SELECT count(*) FROM local_events WHERE id = ?`, got.EventID).Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 1 {
-		t.Fatalf("want 1 local_events row, got %d", count)
-	}
-}
-
-func TestFileStagesDocumentBody(t *testing.T) {
-	dir := t.TempDir()
-	localPath := filepath.Join(dir, "local.sqlite")
-	bodyPath := filepath.Join(dir, "note.md")
-	if err := os.WriteFile(bodyPath, []byte("canonical body"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	out := runCLI(t, "file", "--local", localPath, "--body", bodyPath, "--source", "notes/example", "--resource-uri", "cura://palace/wing/room/example", "--media-type", "text/plain")
-	var got appendResult
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("bad json: %v\\n%s", err, out)
-	}
-	if got.EventID == "" || !got.Fresh {
-		t.Fatalf("bad result: %+v", got)
-	}
-
-	db, err := sql.Open("sqlite", localPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var eventType, content, resourceURI, mediaType string
-	var size int64
-	var body []byte
-	if err := db.QueryRow(`SELECT e.event_type, e.content, e.resource_uri, b.media_type, b.size_bytes, b.content
-		FROM local_events e JOIN local_blobs b ON b.event_id = e.id WHERE e.id = ?`, got.EventID).Scan(&eventType, &content, &resourceURI, &mediaType, &size, &body); err != nil {
-		t.Fatal(err)
-	}
-	if eventType != "document.filed" || content != `{"source":"notes/example"}` {
-		t.Fatalf("event = type %q content %q", eventType, content)
-	}
-	if resourceURI != "cura://palace/wing/room/example" {
-		t.Fatalf("resource URI = %q", resourceURI)
-	}
-	if mediaType != "text/plain" || size != int64(len("canonical body")) || string(body) != "canonical body" {
-		t.Fatalf("blob = media_type %q size %d content %q", mediaType, size, body)
-	}
-}
-
-func TestFileStreamsFilesystemBlobWithoutSQLiteCopy(t *testing.T) {
-	dir := t.TempDir()
-	localPath := filepath.Join(dir, "local.sqlite")
-	root := filepath.Join(dir, "blobs")
-	bodyPath := filepath.Join(dir, "run-output.bin")
-	body := make([]byte, 2<<20)
-	for i := range body {
-		body[i] = byte(i)
-	}
-	if err := os.WriteFile(bodyPath, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	out := runCLI(t, "file", "--local", localPath, "--body", bodyPath, "--source", "runs/example/output", "--media-type", "application/octet-stream", "--blob-store", "filesystem", "--blob-root", root)
-	var got appendResult
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("bad json: %v\\n%s", err, out)
-	}
-
-	db, err := sql.Open("sqlite", localPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var digest string
-	var size int64
-	if err := db.QueryRow(`SELECT sha256, size_bytes FROM local_blob_refs WHERE event_id = ?`, got.EventID).Scan(&digest, &size); err != nil {
-		t.Fatal(err)
-	}
-	if size != int64(len(body)) {
-		t.Fatalf("local blob reference size = %d, want %d", size, len(body))
-	}
-	var stagedCopies int
-	if err := db.QueryRow(`SELECT count(*) FROM local_blobs WHERE event_id = ?`, got.EventID).Scan(&stagedCopies); err != nil {
-		t.Fatal(err)
-	}
-	if stagedCopies != 0 {
-		t.Fatalf("want no SQLite blob copy, got %d", stagedCopies)
-	}
-	if info, err := os.Stat(filepath.Join(root, "sha256", digest[:2], digest[2:4], digest)); err != nil || info.Size() != size {
-		t.Fatalf("filesystem blob = info:%v err:%v, want size %d", info, err, size)
-	}
-}
-
-func TestFileUsesProvidedEventID(t *testing.T) {
-	dir := t.TempDir()
-	localPath := filepath.Join(dir, "local.sqlite")
-	bodyPath := filepath.Join(dir, "note.md")
-	id := "6d68e2af-8e91-4fda-a0dd-959f90bc5af8"
-	if err := os.WriteFile(bodyPath, []byte("canonical body"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	out := runCLI(t, "file", "--id", id, "--local", localPath, "--body", bodyPath, "--source", "notes/example")
-	var got appendResult
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("bad json: %v\n%s", err, out)
-	}
-	if got.EventID != id || !got.Fresh {
-		t.Fatalf("result = %+v, want provided fresh id %q", got, id)
-	}
-}
-
-func TestFileUsesProvidedOccurrenceTime(t *testing.T) {
-	dir := t.TempDir()
-	localPath := filepath.Join(dir, "local.sqlite")
-	bodyPath := filepath.Join(dir, "note.md")
-	occurredAt := "2026-08-22T19:30:00Z"
-	if err := os.WriteFile(bodyPath, []byte("canonical body"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	out := runCLI(t, "file", "--occurred-at", occurredAt, "--local", localPath, "--body", bodyPath, "--source", "notes/example")
-	var got appendResult
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("bad json: %v\n%s", err, out)
-	}
-
-	db, err := sql.Open("sqlite", localPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var stored string
-	if err := db.QueryRow(`SELECT occurred_at FROM local_events WHERE id = ?`, got.EventID).Scan(&stored); err != nil {
-		t.Fatal(err)
-	}
-	if stored != occurredAt {
-		t.Fatalf("occurred_at = %q, want %q", stored, occurredAt)
-	}
-}
-
-func TestFileUsesExplicitEventType(t *testing.T) {
-	dir := t.TempDir()
-	localPath := filepath.Join(dir, "local.sqlite")
-	bodyPath := filepath.Join(dir, "dataset.bin")
-	if err := os.WriteFile(bodyPath, []byte("dataset bytes"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	out := runCLI(t, "file", "--local", localPath, "--body", bodyPath, "--source", "datasets/example/v1", "--type", "dataset.filed")
-	var got appendResult
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("bad json: %v\\n%s", err, out)
-	}
-	db, err := sql.Open("sqlite", localPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var eventType string
-	if err := db.QueryRow(`SELECT event_type FROM local_events WHERE id = ?`, got.EventID).Scan(&eventType); err != nil {
-		t.Fatal(err)
-	}
-	if eventType != "dataset.filed" {
-		t.Fatalf("event_type = %q, want dataset.filed", eventType)
-	}
-}
-
-func TestAppendUsesExplicitActor(t *testing.T) {
-	dir := t.TempDir()
-	localPath := filepath.Join(dir, "local.sqlite")
-
-	out := runCLI(t, "append", "--actor", "duro_ingest", "--local", localPath, "--type", "test.type", "--content", `{"a":1}`)
-	var got appendResult
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("bad json: %v\\n%s", err, out)
-	}
-
-	db, err := sql.Open("sqlite", localPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var actor string
-	if err := db.QueryRow(`SELECT actor FROM local_events WHERE id = ?`, got.EventID).Scan(&actor); err != nil {
-		t.Fatal(err)
-	}
-	if actor != "duro_ingest" {
-		t.Fatalf("actor = %q, want explicit actor", actor)
-	}
-}
-
-func TestAppendRequiresContentType(t *testing.T) {
-	dir := t.TempDir()
-	localPath := filepath.Join(dir, "local.sqlite")
-
-	if _, err := runCLIErr(t, "append", "--local", localPath, "--content", `{"a":1}`); err == nil {
-		t.Fatal("expected failure without --type")
-	}
-}
-
-func TestAppendRejectsNonObjectContent(t *testing.T) {
-	dir := t.TempDir()
-	localPath := filepath.Join(dir, "local.sqlite")
-
-	out, err := runCLIErr(t, "append", "--local", localPath, "--type", "test.type", "--content", `"just a string"`)
-	if err == nil {
-		t.Fatalf("expected failure for non-object content, got output %s", out)
-	}
-}
-
-func TestReadRequiresSource(t *testing.T) {
-	out, err := runCLIErr(t, "read", "--postgres", "postgresql://example")
-	if err == nil || !strings.Contains(string(out), "--postgres and --source are required") {
-		t.Fatalf("read without source = err %v output %q", err, out)
-	}
-}
-
-func TestReadReturnsLatestCanonicalDocument(t *testing.T) {
-	dsn := testPostgresDSN(t)
-	dir := t.TempDir()
-	localPath := filepath.Join(dir, "local.sqlite")
-	source := "example/test/diary"
-
-	for _, body := range []string{"older", "newer"} {
-		bodyPath := filepath.Join(dir, body+".txt")
-		if err := os.WriteFile(bodyPath, []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		runCLI(t, "file", "--local", localPath, "--body", bodyPath, "--source", source, "--media-type", "text/plain")
-		runCLI(t, "sync", "--local", localPath, "--postgres", dsn)
-	}
-
-	out := runCLI(t, "read", "--postgres", dsn, "--source", source)
-	var got readResult
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("bad read JSON: %v\n%s", err, out)
-	}
-	if !got.Found || got.Body != "newer" || got.Source != source || got.Sequence <= 0 || got.EventID == "" || got.BlobSHA256 == "" {
-		t.Fatalf("read result = %+v, want newest document with provenance", got)
-	}
-	if _, err := runCLIErr(t, "read", "--postgres", dsn, "--source", source, "--max-bytes", "4"); err == nil {
-		t.Fatal("expected bounded read to reject larger body")
-	}
-}
-
-func TestListRequiresPostgres(t *testing.T) {
-	out, err := runCLIErr(t, "list")
-	if err == nil || !strings.Contains(string(out), "--postgres is required") {
-		t.Fatalf("list without postgres = err %v output %q", err, out)
-	}
-}
-
-func TestListReturnsCurrentCanonicalDocumentMetadata(t *testing.T) {
-	dsn := testPostgresDSN(t)
-	dir := t.TempDir()
-	localPath := filepath.Join(dir, "local.sqlite")
-	for _, doc := range []struct {
-		name, source, body, resourceURI string
-	}{
-		{"alpha-old", "example/drawers/alpha", "alpha-old", ""},
-		{"beta", "example/drawers/beta", "beta", "cura://palace/wing/room/beta"},
-		{"alpha-new", "example/drawers/alpha", "alpha-new", ""},
-	} {
-		bodyPath := filepath.Join(dir, doc.name+".txt")
-		if err := os.WriteFile(bodyPath, []byte(doc.body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		args := []string{"file", "--local", localPath, "--body", bodyPath, "--source", doc.source, "--media-type", "text/plain"}
-		if doc.resourceURI != "" {
-			args = append(args, "--resource-uri", doc.resourceURI)
-		}
-		runCLI(t, args...)
-		runCLI(t, "sync", "--local", localPath, "--postgres", dsn)
-	}
-
-	out := runCLI(t, "list", "--postgres", dsn, "--after", "0", "--limit", "10")
-	var got struct {
-		Documents []readResult `json:"documents"`
-		Cursor    int64        `json:"cursor"`
-	}
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("bad list JSON: %v\n%s", err, out)
-	}
-	if len(got.Documents) != 2 || got.Documents[0].Source != "example/drawers/beta" || got.Documents[1].Source != "example/drawers/alpha" {
-		t.Fatalf("list result = %+v, want current beta then alpha", got)
-	}
-	for _, doc := range got.Documents {
-		if !doc.Found || doc.EventID == "" || doc.BlobSHA256 == "" || doc.MediaType != "text/plain" || doc.Body != "" {
-			t.Fatalf("listed document = %+v, want metadata with canonical provenance only", doc)
-		}
-	}
-	if got.Documents[0].ResourceURI != "cura://palace/wing/room/beta" || got.Documents[1].ResourceURI != "" {
-		t.Fatalf("listed resource URIs = %#v", got.Documents)
-	}
-	if got.Cursor != got.Documents[1].Sequence {
-		t.Fatalf("cursor = %d, want final sequence %d", got.Cursor, got.Documents[1].Sequence)
-	}
-}
-
-func TestInitAppliesCanonicalSchema(t *testing.T) {
-	dsn := os.Getenv("DURO_POSTGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("DURO_POSTGRES_TEST_DSN not set; skipping PostgreSQL integration test")
-	}
-	raw, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Close()
-	raw.SetMaxOpenConns(1)
-	if _, err := raw.Exec(`SELECT pg_advisory_lock($1)`, testAdvisoryLockKey); err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
-
-	runCLI(t, "init", "--postgres", dsn)
-	var events sql.NullString
-	if err := raw.QueryRow(`SELECT to_regclass('public.events')`).Scan(&events); err != nil {
-		t.Fatal(err)
-	}
-	if events.String != "events" {
-		t.Fatalf("events table missing after init: %q", events.String)
-	}
-}
-
-// testPostgresDSN skips the test clearly when DURO_POSTGRES_TEST_DSN is
-// unset, and otherwise returns it after truncating the canonical tables.
-func testPostgresDSN(t *testing.T) string {
+func initializedDB(t *testing.T) string {
 	t.Helper()
-	dsn := os.Getenv("DURO_POSTGRES_TEST_DSN")
-	if dsn == "" {
-		t.Skip("DURO_POSTGRES_TEST_DSN not set; skipping PostgreSQL integration test")
+	dsn := pgtest.NewDatabase(t)
+	got := duro(t, nil, "init", "--postgres", dsn)
+	if got.code != 0 {
+		t.Fatalf("duro init: exit %d, stderr %s", got.code, got.stderr)
 	}
-	raw, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
+	var payload map[string]bool
+	if err := json.Unmarshal([]byte(got.stdout), &payload); err != nil || !payload["initialized"] {
+		t.Fatalf("init stdout = %q (%v)", got.stdout, err)
 	}
-	raw.SetMaxOpenConns(1)
-	if _, err := raw.Exec(`SELECT pg_advisory_lock($1)`, testAdvisoryLockKey); err != nil {
-		raw.Close()
-		t.Fatalf("acquire test lock: %v", err)
-	}
-	if err := postgres.Initialize(dsn); err != nil {
-		_, _ = raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
-		raw.Close()
-		t.Fatalf("postgres.Initialize: %v", err)
-	}
-	if _, err := raw.Exec(`TRUNCATE events, blobs, blob_locator_observations RESTART IDENTITY`); err != nil {
-		_, _ = raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
-		raw.Close()
-		t.Fatalf("truncate: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = raw.Exec(`SELECT pg_advisory_unlock($1)`, testAdvisoryLockKey)
-		raw.Close()
-	})
 	return dsn
 }
 
-// TestAppendSyncPullRoundTrip is the append -> sync -> pull smoke test: an
-// offline append survives to a sync push, and a second, fresh local
-// replica can pull the canonical result back.
-func TestAppendSyncPullRoundTrip(t *testing.T) {
-	dsn := testPostgresDSN(t)
-	dir := t.TempDir()
-	pushPath := filepath.Join(dir, "push.sqlite")
-	pullPath := filepath.Join(dir, "pull.sqlite")
-
-	appendOut := runCLI(t, "append", "--local", pushPath, "--type", "test.type", "--content", `{"a":1}`)
-	var appended appendResult
-	if err := json.Unmarshal(appendOut, &appended); err != nil {
-		t.Fatalf("bad json: %v\n%s", err, appendOut)
+// TestEndToEnd exercises the real CLI paths against a real database and a
+// real store: init (twice), append, artifact put (twice), artifact get to a
+// file and to stdout, plus a committed readback.
+func TestEndToEnd(t *testing.T) {
+	dsn := initializedDB(t)
+	if got := duro(t, nil, "init", "--postgres", dsn); got.code != 0 {
+		t.Fatalf("second init: exit %d, stderr %s", got.code, got.stderr)
 	}
 
-	syncOut := runCLI(t, "sync", "--local", pushPath, "--postgres", dsn)
-	var synced syncResult
-	if err := json.Unmarshal(syncOut, &synced); err != nil {
-		t.Fatalf("bad json: %v\n%s", err, syncOut)
+	got := duro(t, nil, "append", "--postgres", dsn, "--type", "document.tagged", "--content", `{"tag":"reviewed"}`)
+	if got.code != 0 {
+		t.Fatalf("append: exit %d, stderr %s", got.code, got.stderr)
 	}
-	if synced.Accepted != 1 {
-		t.Fatalf("want 1 accepted, got %+v", synced)
+	var first eventJSON
+	if err := json.Unmarshal([]byte(got.stdout), &first); err != nil {
+		t.Fatalf("append stdout %q: %v", got.stdout, err)
+	}
+	if first.ID == "" || first.Actor == "" || first.ReceivedAt == "" || first.EventType != "document.tagged" {
+		t.Errorf("append output missing database-assigned fields: %+v", first)
+	}
+	if string(first.Refs) != "{}" {
+		t.Errorf("refs = %s, want {}", first.Refs)
+	}
+	// Repeating the same input creates a distinct event.
+	repeat := duro(t, nil, "append", "--postgres", dsn, "--type", "document.tagged", "--content", `{"tag":"reviewed"}`)
+	var second eventJSON
+	if err := json.Unmarshal([]byte(repeat.stdout), &second); err != nil {
+		t.Fatalf("repeat append stdout %q: %v", repeat.stdout, err)
+	}
+	if second.ID == first.ID {
+		t.Error("repeated append reused an id")
 	}
 
-	pullOut := runCLI(t, "pull", "--local", pullPath, "--postgres", dsn)
-	var pulled pullResult
-	if err := json.Unmarshal(pullOut, &pulled); err != nil {
-		t.Fatalf("bad json: %v\n%s", err, pullOut)
+	// artifact put, twice: the second reuses the bytes and appends a second
+	// observation event.
+	root := filepath.Join(t.TempDir(), "store")
+	data := bytes.Repeat([]byte("cli artifact "), 1000)
+	src := filepath.Join(t.TempDir(), "payload.bin")
+	if err := os.WriteFile(src, data, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if pulled.Applied != 1 {
-		t.Fatalf("want 1 applied, got %+v", pulled)
+	sum := sha256.Sum256(data)
+	identity := "sha256:" + hex.EncodeToString(sum[:])
+
+	var receipts []struct {
+		Digest string    `json:"digest"`
+		Size   int64     `json:"size_bytes"`
+		Event  eventJSON `json:"event"`
 	}
-	if pulled.Cursor <= 0 {
-		t.Fatalf("want positive cursor, got %d", pulled.Cursor)
+	for i := range 2 {
+		put := duro(t, nil, "artifact", "put", "--postgres", dsn, "--root", root, "--file", src)
+		if put.code != 0 {
+			t.Fatalf("put %d: exit %d, stderr %s", i, put.code, put.stderr)
+		}
+		var receipt struct {
+			Digest string    `json:"digest"`
+			Size   int64     `json:"size_bytes"`
+			Event  eventJSON `json:"event"`
+		}
+		if err := json.Unmarshal([]byte(put.stdout), &receipt); err != nil {
+			t.Fatalf("put %d stdout %q: %v", i, put.stdout, err)
+		}
+		if receipt.Digest != identity || receipt.Size != int64(len(data)) {
+			t.Errorf("put %d receipt = %s / %d", i, receipt.Digest, receipt.Size)
+		}
+		if receipt.Event.EventType != "artifact.observed" {
+			t.Errorf("put %d event_type = %q", i, receipt.Event.EventType)
+		}
+		if !strings.Contains(string(receipt.Event.Content), src) {
+			t.Errorf("put %d content %s missing source_path %s", i, receipt.Event.Content, src)
+		}
+		receipts = append(receipts, receipt)
+	}
+	if receipts[0].Event.ID == receipts[1].Event.ID {
+		t.Error("duplicate-content put reused the observation event")
 	}
 
-	db, err := sql.Open("sqlite", pullPath)
+	// get to a file, then refuse to overwrite it; then get to stdout.
+	out := filepath.Join(t.TempDir(), "restored.bin")
+	if g := duro(t, nil, "artifact", "get", "--root", root, "--sha256", identity, "--out", out); g.code != 0 {
+		t.Fatalf("get --out: exit %d, stderr %s", g.code, g.stderr)
+	}
+	restored, err := os.ReadFile(out)
+	if err != nil || !bytes.Equal(restored, data) {
+		t.Fatalf("restored bytes differ (%v)", err)
+	}
+	if g := duro(t, nil, "artifact", "get", "--root", root, "--sha256", identity, "--out", out); g.code == 0 {
+		t.Error("get overwrote an existing destination")
+	}
+	if g := duro(t, nil, "artifact", "get", "--root", root, "--sha256", identity); g.code != 0 || g.stdout != string(data) {
+		t.Errorf("get to stdout: exit %d, %d bytes", g.code, len(g.stdout))
+	}
+	// A missing artifact fails even though the store root exists.
+	absent := sha256.Sum256([]byte("never stored"))
+	if g := duro(t, nil, "artifact", "get", "--root", root, "--sha256", "sha256:"+hex.EncodeToString(absent[:])); g.code == 0 {
+		t.Error("get of an absent artifact succeeded")
+	}
+
+	// Committed readback: 2 appends + 2 observation events.
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	var content string
-	if err := db.QueryRow(`SELECT content FROM local_events WHERE id = ?`, appended.EventID).Scan(&content); err != nil {
-		t.Fatalf("select pulled event: %v", err)
+	var total, observed int
+	if err := db.QueryRow(`SELECT count(*), count(*) FILTER (WHERE event_type = 'artifact.observed') FROM public.events`).Scan(&total, &observed); err != nil {
+		t.Fatal(err)
 	}
-	// PostgreSQL's JSONB round-trips {"a":1} as {"a": 1} (a space after the
-	// colon); the pulled local row reflects canonical's serialization.
-	if content != `{"a": 1}` {
-		t.Fatalf(`want content {"a": 1}, got %s`, content)
+	if total != 4 || observed != 2 {
+		t.Errorf("ledger holds %d events (%d observations), want 4 (2)", total, observed)
 	}
 }
 
-// TestSyncReportsConflict exercises the conflict branch of sync's counts:
-// a local row retried with different content than what's already
-// canonical is reported, not silently dropped or overwritten.
-func TestSyncReportsConflict(t *testing.T) {
-	dsn := testPostgresDSN(t)
-	dir := t.TempDir()
-	localPath := filepath.Join(dir, "local.sqlite")
-
-	appendOut := runCLI(t, "append", "--local", localPath, "--type", "test.type", "--content", `{"a":1}`)
-	var appended appendResult
-	if err := json.Unmarshal(appendOut, &appended); err != nil {
-		t.Fatalf("bad json: %v\n%s", err, appendOut)
+func TestEnvFallbackAndFlagPrecedence(t *testing.T) {
+	dsn := initializedDB(t)
+	root := filepath.Join(t.TempDir(), "store")
+	src := filepath.Join(t.TempDir(), "env.bin")
+	if err := os.WriteFile(src, []byte("env fallback"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := runCLIErr(t, "sync", "--local", localPath, "--postgres", dsn); err != nil {
-		t.Fatalf("first sync failed: %v", err)
+	env := []string{"DURO_POSTGRES_DSN=" + dsn, "DURO_CAS_ROOT=" + root}
+
+	if got := duro(t, env, "append", "--type", "env.fallback"); got.code != 0 {
+		t.Errorf("append via env fallback: exit %d, stderr %s", got.code, got.stderr)
+	}
+	if got := duro(t, env, "artifact", "put", "--file", src); got.code != 0 {
+		t.Errorf("put via env fallback: exit %d, stderr %s", got.code, got.stderr)
 	}
 
-	// Overwrite the local row's content directly (bypassing append's
-	// dup/conflict check) to simulate a second node having queued a
-	// different payload under the same id before this one saw canonical.
-	db, err := sql.Open("sqlite", localPath)
+	// Flags win over the environment: a broken env plus a good flag works,
+	// and a good env plus a broken flag fails.
+	broken := []string{"DURO_POSTGRES_DSN=postgres://nobody@127.0.0.1:1/none?sslmode=disable&connect_timeout=2", "DURO_CAS_ROOT=/nonexistent/duro-root"}
+	if got := duro(t, broken, "append", "--postgres", dsn, "--type", "flag.wins"); got.code != 0 {
+		t.Errorf("flag should override a broken env DSN: exit %d, stderr %s", got.code, got.stderr)
+	}
+	if got := duro(t, env, "append", "--postgres", "postgres://nobody@127.0.0.1:1/none?sslmode=disable&connect_timeout=2", "--type", "flag.wins"); got.code == 0 {
+		t.Error("a broken --postgres flag should not fall back to the environment")
+	}
+	if got := duro(t, broken, "artifact", "get", "--root", root, "--sha256", "sha256:"+strings.Repeat("ab", 32)); got.code == 0 {
+		t.Error("get of an absent digest succeeded")
+	} else if strings.Contains(got.stderr, "nonexistent") {
+		t.Errorf("--root flag did not override DURO_CAS_ROOT: %s", got.stderr)
+	}
+}
+
+// TestPartialOutcomeErrorSchema drives the real stored-artifact/failed-append
+// boundary: a reader-only DSN can stage and publish bytes but cannot append,
+// so the CLI must report the machine-readable partial outcome and keep the
+// artifact.
+func TestPartialOutcomeErrorSchema(t *testing.T) {
+	adminDSN := initializedDB(t)
+	reader, readerDSN := pgtest.NewRole(t, adminDSN)
+	if err := postgres.ProvisionReader(adminDSN, reader); err != nil {
+		t.Fatalf("ProvisionReader: %v", err)
+	}
+	root := filepath.Join(t.TempDir(), "store")
+	data := []byte("stored without an event")
+	src := filepath.Join(t.TempDir(), "orphan.bin")
+	if err := os.WriteFile(src, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	identity := "sha256:" + hex.EncodeToString(sum[:])
+
+	got := duro(t, nil, "artifact", "put", "--postgres", readerDSN, "--root", root, "--file", src)
+	if got.code == 0 {
+		t.Fatal("put with a reader-only DSN succeeded")
+	}
+	if got.stdout != "" {
+		t.Errorf("wrote a success receipt to stdout: %q", got.stdout)
+	}
+	var reported struct {
+		Digest         string `json:"digest"`
+		Size           int64  `json:"size_bytes"`
+		ArtifactStored bool   `json:"artifact_stored"`
+		EventOutcome   string `json:"event_outcome"`
+		Error          string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(got.stderr), &reported); err != nil {
+		t.Fatalf("stderr is not the documented JSON error object: %q (%v)", got.stderr, err)
+	}
+	if reported.Digest != identity || reported.Size != int64(len(data)) || !reported.ArtifactStored {
+		t.Errorf("partial outcome = %+v", reported)
+	}
+	if reported.EventOutcome != "not_committed" {
+		t.Errorf("event_outcome = %q, want not_committed (the server refused the insert)", reported.EventOutcome)
+	}
+	if reported.Error == "" {
+		t.Error("error field is empty")
+	}
+	// The artifact is retained: a later get succeeds.
+	out := filepath.Join(t.TempDir(), "retained.bin")
+	if g := duro(t, nil, "artifact", "get", "--root", root, "--sha256", identity, "--out", out); g.code != 0 {
+		t.Fatalf("retained artifact unreadable: exit %d, stderr %s", g.code, g.stderr)
+	}
+	if restored, err := os.ReadFile(out); err != nil || !bytes.Equal(restored, data) {
+		t.Errorf("retained artifact differs (%v)", err)
+	}
+}
+
+// TestInitProvisionsRoles covers init's optional role flags end to end,
+// including its refusal to "secure" a role it cannot restrict.
+func TestInitProvisionsRoles(t *testing.T) {
+	adminDSN := initializedDB(t)
+	writer, writerDSN := pgtest.NewRole(t, adminDSN)
+	reader, readerDSN := pgtest.NewRole(t, adminDSN)
+	if got := duro(t, nil, "init", "--postgres", adminDSN, "--writer", writer, "--reader", reader); got.code != 0 {
+		t.Fatalf("init with roles: exit %d, stderr %s", got.code, got.stderr)
+	}
+	appended := duro(t, nil, "append", "--postgres", writerDSN, "--type", "writer.cli.append")
+	if appended.code != 0 {
+		t.Fatalf("writer append: exit %d, stderr %s", appended.code, appended.stderr)
+	}
+	var se eventJSON
+	if err := json.Unmarshal([]byte(appended.stdout), &se); err != nil {
+		t.Fatal(err)
+	}
+	if se.Actor != writer {
+		t.Errorf("actor = %q, want %q", se.Actor, writer)
+	}
+	if got := duro(t, nil, "append", "--postgres", readerDSN, "--type", "reader.cli.append"); got.code == 0 {
+		t.Error("reader was allowed to append through the CLI")
+	}
+	// The administrator/owner role cannot be provisioned as a writer.
+	var owner string
+	db, err := sql.Open("pgx", adminDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE local_events SET content = ?, synced_at = NULL WHERE id = ?`, `{"a":2}`, appended.EventID); err != nil {
-		db.Close()
+	defer db.Close()
+	if err := db.QueryRow(`SELECT session_user`).Scan(&owner); err != nil {
 		t.Fatal(err)
 	}
-	db.Close()
-
-	syncOut := runCLI(t, "sync", "--local", localPath, "--postgres", dsn)
-	var synced syncResult
-	if err := json.Unmarshal(syncOut, &synced); err != nil {
-		t.Fatalf("bad json: %v\n%s", err, syncOut)
-	}
-	if synced.Conflict != 1 {
-		t.Fatalf("want 1 conflict, got %+v", synced)
-	}
-}
-
-func TestArtifactPutLocateVerifyFilesystemCatalog(t *testing.T) {
-	dsn := testPostgresDSN(t)
-	dir := t.TempDir()
-	root := filepath.Join(dir, "blobs")
-
-	firstFile := filepath.Join(dir, "first.bin")
-	if err := os.WriteFile(firstFile, []byte("first artifact"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	firstLocator := "file:///incoming/a%25/run.bin"
-	putOut := runCLI(t, "artifact", "put", "--postgres", dsn, "--blob-root", root, "--file", firstFile, "--locator", firstLocator)
-	var first artifactPutResult
-	if err := json.Unmarshal(putOut, &first); err != nil {
-		t.Fatalf("bad artifact put JSON: %v\n%s", err, putOut)
-	}
-	if !first.Fresh || first.SHA256 == "" || first.Size != int64(len("first artifact")) {
-		t.Fatalf("artifact put = %+v", first)
-	}
-	if _, err := os.Stat(filepath.Join(root, "sha256", first.SHA256[:2], first.SHA256[2:4], first.SHA256)); err != nil {
-		t.Fatalf("artifact CAS file: %v", err)
-	}
-
-	secondFile := filepath.Join(dir, "second.bin")
-	if err := os.WriteFile(secondFile, []byte("second artifact"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	runCLI(t, "artifact", "put", "--postgres", dsn, "--blob-root", root, "--file", secondFile, "--locator", "file:///incoming/ax25/run.bin")
-
-	locateOut := runCLI(t, "artifact", "locate", "--postgres", dsn, "--prefix", "file:///incoming/a%25/")
-	var located struct {
-		Locators []postgres.Locator `json:"locators"`
-	}
-	if err := json.Unmarshal(locateOut, &located); err != nil {
-		t.Fatalf("bad artifact locate JSON: %v\n%s", err, locateOut)
-	}
-	if len(located.Locators) != 1 || located.Locators[0].Locator != firstLocator || located.Locators[0].SHA256 != first.SHA256 {
-		t.Fatalf("literal locator prefix result = %+v", located)
-	}
-
-	verifyOut := runCLI(t, "artifact", "verify", "--postgres", dsn, "--blob-root", root, "--sha256", first.SHA256)
-	var verified artifactVerifyResult
-	if err := json.Unmarshal(verifyOut, &verified); err != nil {
-		t.Fatalf("bad artifact verify JSON: %v\n%s", err, verifyOut)
-	}
-	if !verified.Verified || verified.SHA256 != first.SHA256 || verified.Size != first.Size || verified.LastVerifiedAt.IsZero() {
-		t.Fatalf("artifact verify = %+v", verified)
+	if got := duro(t, nil, "init", "--postgres", adminDSN, "--writer", owner); got.code == 0 {
+		t.Error("init provisioned the owner role as a writer")
 	}
 }

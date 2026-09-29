@@ -1,105 +1,56 @@
--- Canonical event table. sequence is the PostgreSQL identity Duro's pull
--- cursor orders by; gaps in it are expected (rolled-back inserts, deleted
--- rows, concurrent writers) and must never be backfilled.
-CREATE TABLE IF NOT EXISTS events (
-    sequence    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    id          UUID NOT NULL UNIQUE,
-    occurred_at TIMESTAMPTZ NOT NULL,
-    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+-- Duro's canonical event ledger. This is the entire schema: one
+-- append-only table. id, received_at, and actor are database-owned:
+-- ordinary writer credentials get column-level INSERT privilege on
+-- event_type/content/refs only (see ProvisionWriter and the README), so
+-- they physically cannot forge identity, time, or authority, and no trigger
+-- or SECURITY DEFINER function is needed to police that boundary.
+--
+-- pg_catalog is schema-qualified throughout so a writer role's search_path
+-- can never substitute a same-named function ahead of the built-in one.
+-- The table itself is always addressed as public.events for the same
+-- reason: an unqualified "events" would resolve against whatever schema a
+-- caller's search_path happens to put first.
+CREATE TABLE IF NOT EXISTS public.events (
+    -- clock_timestamp() (real wall-clock time at row evaluation), not
+    -- now()/transaction_timestamp() (frozen at transaction start): the
+    -- contract's received_at is the insertion instant.
+    id          UUID NOT NULL DEFAULT pg_catalog.uuidv7() PRIMARY KEY,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT pg_catalog.clock_timestamp(),
     event_type  TEXT NOT NULL,
-    actor       TEXT NOT NULL,
-    content     JSONB NOT NULL CHECK (jsonb_typeof(content) = 'object'),
-    refs        JSONB NOT NULL CHECK (jsonb_typeof(refs) = 'object')
+    actor       TEXT NOT NULL DEFAULT session_user,
+    content     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    refs        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- Nonblank means more than non-empty: a string made entirely of Unicode
+    -- whitespace (including non-ASCII separators such as U+00A0 NBSP or
+    -- U+3000 IDEOGRAPHIC SPACE) is blank too. The trim set is the 25
+    -- characters Go's unicode.IsSpace accepts, written as explicit code
+    -- points rather than a POSIX [[:space:]] class whose treatment of
+    -- non-ASCII characters depends on server locale/ctype. Spelling it out
+    -- keeps the rule identical in every deployment and identical to the
+    -- strings.TrimSpace pre-check in pkg/event.
+    CONSTRAINT events_event_type_nonblank CHECK (
+        pg_catalog.btrim(
+            event_type,
+            U&'\0009\000A\000B\000C\000D\0020\0085\00A0\1680\2000\2001\2002\2003\2004\2005\2006\2007\2008\2009\200A\2028\2029\202F\205F\3000'
+        ) <> ''
+    ),
+    -- octet_length(convert_to(x, 'UTF8')) rather than octet_length(x): the
+    -- latter measures bytes in the database's server_encoding, which equals
+    -- UTF-8 byte length only if server_encoding is itself UTF8. Initialize
+    -- refuses non-UTF8 databases, but this keeps the rule correct even if
+    -- the schema is applied by hand elsewhere.
+    CONSTRAINT events_event_type_max_bytes CHECK (pg_catalog.octet_length(pg_catalog.convert_to(event_type, 'UTF8')) <= 255),
+    CONSTRAINT events_content_is_object CHECK (pg_catalog.jsonb_typeof(content) = 'object'),
+    CONSTRAINT events_content_max_bytes CHECK (pg_catalog.octet_length(pg_catalog.convert_to(content::text, 'UTF8')) <= 1048576),
+    CONSTRAINT events_refs_is_object CHECK (pg_catalog.jsonb_typeof(refs) = 'object'),
+    CONSTRAINT events_refs_max_bytes CHECK (pg_catalog.octet_length(pg_catalog.convert_to(refs::text, 'UTF8')) <= 1048576)
 );
 
--- event_type carries the same boundary rule as event.Validate: rejected only
--- when empty, so a raw SQL insert can't bypass Go and land an untyped
--- canonical event. PostgreSQL has no ADD CONSTRAINT IF NOT EXISTS; tolerate
--- a concurrent initializer that added the same named constraint first.
-DO $$
-BEGIN
-    ALTER TABLE events ADD CONSTRAINT events_event_type_nonempty CHECK (event_type <> '');
-EXCEPTION
-    WHEN duplicate_object THEN NULL;
-END;
-$$;
+-- The PRIMARY KEY above already gives ascending-id reads (the contract's
+-- required ordering) a btree index; no separate index is needed.
 
-ALTER TABLE events ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS events_public_baseline ON events;
-CREATE POLICY events_public_baseline ON events AS PERMISSIVE FOR ALL TO PUBLIC USING (true) WITH CHECK (true);
-
--- Canonical blob store, content-addressed by sha256. Deduplicated on
--- insert: two events whose blob bytes hash the same share one row.
--- content is nullable: a blob whose bytes are held by an external backend
--- (e.g. pkg/blob's filesystem store) still gets a metadata row here --
--- sha256/size_bytes/media_type and the event FK -- without duplicating
--- bytes into PostgreSQL.
-CREATE TABLE IF NOT EXISTS blobs (
-    id          UUID PRIMARY KEY,
-    sha256      BYTEA NOT NULL UNIQUE,
-    media_type  TEXT,
-    size_bytes  BIGINT NOT NULL CHECK (size_bytes >= 0),
-    content     BYTEA,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- Idempotent for a database initialized before content became nullable.
-ALTER TABLE blobs ALTER COLUMN content DROP NOT NULL;
-
--- When this blob's stored bytes were last streamed through their digest and
--- found intact. NULL means never verified since cataloging; it is operational
--- metadata about a check, not part of the blob's immutable identity.
-ALTER TABLE blobs ADD COLUMN IF NOT EXISTS last_verified_at TIMESTAMPTZ;
-
--- Observations of where a blob's bytes were seen physically, many per blob.
--- These are *source* locators supplied by whoever cataloged the artifact --
--- never the derived CAS destination path, which is a function of the digest
--- and the deployment's blob root and so carries no information. Distinct from
--- events.resource_uri, which is event-time logical metadata rather than an
--- observation of physical storage. (blob_sha256, locator) is the primary key,
--- so re-observing the same locator refreshes observed_at instead of appending
--- a duplicate row.
-CREATE TABLE IF NOT EXISTS blob_locator_observations (
-    blob_sha256 BYTEA NOT NULL REFERENCES blobs(sha256),
-    locator     TEXT NOT NULL CHECK (locator <> ''),
-    observed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (blob_sha256, locator)
-);
-
--- An event may carry at most one associated blob, referenced by digest
--- rather than blobs.id so dedup (same bytes, different uploader) never
--- requires the caller to know which row happened to win the insert race.
-ALTER TABLE events ADD COLUMN IF NOT EXISTS blob_sha256 BYTEA REFERENCES blobs(sha256);
--- Blob bytes are deduplicated, but their requested media type belongs to the
--- event: identical bytes can represent different documents.
-ALTER TABLE events ADD COLUMN IF NOT EXISTS blob_media_type TEXT;
--- Optional event-time logical resource metadata. Duro preserves opaque absolute
--- URIs; individual projects own scheme/path grammar and reader semantics.
-ALTER TABLE events ADD COLUMN IF NOT EXISTS resource_uri TEXT;
-
--- New canonical IDs receive their actor from the authenticated PostgreSQL
--- role. Existing IDs retain their historical actor during idempotent retries.
-CREATE OR REPLACE FUNCTION duro_bind_event_actor() RETURNS trigger
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    existing_actor TEXT;
-BEGIN
-    SELECT e.actor INTO existing_actor FROM events AS e WHERE e.id = NEW.id;
-    IF FOUND THEN
-        NEW.actor := existing_actor;
-    ELSE
-        NEW.actor := current_user;
-    END IF;
-    RETURN NEW;
-END;
-$$;
-
-DROP TRIGGER IF EXISTS events_bind_actor ON events;
-CREATE TRIGGER events_bind_actor
-BEFORE INSERT ON events
-FOR EACH ROW EXECUTE FUNCTION duro_bind_event_actor();
-
--- Scoped projectors page only their fixed event types and deployment scope.
-CREATE INDEX IF NOT EXISTS events_type_scope_sequence_idx
-    ON events (event_type, (content->>'deployment_scope'), sequence);
+-- Belt-and-suspenders: a freshly created table has no PUBLIC grants by
+-- default, but state that explicitly rather than relying on the cluster's
+-- default privileges never having been changed. Scoped to this one table,
+-- not a cluster-wide REVOKE.
+REVOKE ALL ON public.events FROM PUBLIC;
