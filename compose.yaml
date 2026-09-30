@@ -9,14 +9,14 @@ services:
       POSTGRES_USER: ${DURO_POSTGRES_USER:-duro}
       POSTGRES_PASSWORD: ${DURO_POSTGRES_PASSWORD:?set DURO_POSTGRES_PASSWORD}
     ports:
-      - "${DURO_POSTGRES_BIND:-127.0.0.1}:${DURO_POSTGRES_PORT:-5433}:5432"
+      - "${DURO_POSTGRES_BIND:-0.0.0.0}:${DURO_POSTGRES_PORT:-5433}:5432"
     volumes:
       # PostgreSQL 18 images keep the cluster under /var/lib/postgresql/18/docker
       # and declare the parent directory as the volume, so mount the parent,
       # not .../data as the 16 images wanted. The default host directory is
       # deliberately distinct from the PostgreSQL 16 one: pointing this at a
       # 16 data directory would fail to start, and Duro does not migrate.
-      - ${DURO_POSTGRES_DATA_DIR:-./.duro-postgres18-data}:/var/lib/postgresql
+      - ${DURO_POSTGRES_DATA_DIR:-/var/lib/duro/data}:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 2s
